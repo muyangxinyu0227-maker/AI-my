@@ -1,0 +1,25 @@
+# Dependencies
+node_modules/
+.pnp/
+.pnp.js
+
+# Testing
+coverage/
+
+# Production
+build/
+dist/
+
+# Misc
+.DS_Store
+*.log
+npm-debug.log*
+
+# Claude Code
+.claude/settings.local.json
+.mcp.json
+
+# Secrets
+*.env
+*.env.local
+credentials.json
