@@ -1,0 +1,20 @@
+{
+  "hooks": {
+    "afterEdit": ["npm run lint", "npm test"]
+  },
+  "permissions": {
+    "allow": [
+      "Bash(git status)",
+      "Bash(git log:*)",
+      "Bash(npm test:*)",
+      "Bash(npm run:*)",
+      "Edit(src/**/*.{js,ts,jsx,tsx})",
+      "Read(.{js,ts,json,md})"
+    ],
+    "ask": [
+      "Bash(git commit:*)",
+      "Bash(git push:*)",
+      "Bash(npm publish:*)"
+    ]
+  }
+}

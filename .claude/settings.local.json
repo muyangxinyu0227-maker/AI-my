@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(which node:*)",
+      "Bash(claude mcp:*)",
+      "Bash(gh auth:*)",
+      "Bash(npx:*)",
+      "Bash(curl:*)",
+      "WebFetch(domain:datawhalechina.github.io)",
+      "WebSearch",
+      "Bash(ls:*)",
+      "Bash(git init:*)",
+      "Bash(git add:*)"
+    ]
+  }
+}
