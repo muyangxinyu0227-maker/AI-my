@@ -1,0 +1,33 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Logs
+*.log
+
+# docx artifacts (regeneratable from md)
+*.docx
+
+# Node
+node_modules/
+
+# Simulation artifacts
+xcelium.d/
+INCA_libs/
+simv
+simv.daidir/
+csrc/
+*.fsdb
+*.vpd
+*.vcd
+*.key
+ucli.key
+DVEfiles/
+vc_hdrs.h
+waves.shm/
+*.diag
+.restart*
