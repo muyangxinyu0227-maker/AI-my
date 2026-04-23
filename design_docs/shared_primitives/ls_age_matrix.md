@@ -203,4 +203,502 @@ this task, per pilot scope.)
 
 ---
 
-<!-- §4–§8 to be written in Task 5 (Gate 4) and Task 6 (Gate 5) -->
+## §4 Ports and Interface
+
+All vector widths are expressed in terms of the single module parameter
+`AM_SIZE`, which is the entry-pool depth `N`. The `src*_older` hints are the
+only fixed-width ports (4 bits each, one bit per source port).
+
+### §4.1 Input ports
+
+| Name                 | Width              | Direction | Role                                                                                                                    |
+|----------------------|--------------------|-----------|-------------------------------------------------------------------------------------------------------------------------|
+| `clk`                | `1`                | input     | Positive-edge clock for the age-matrix flops (`perseus_ls_age_matrix.sv:L28`, used at `L152`).                          |
+| `reset_i`            | `1`                | input     | Asynchronous, active-high reset; clears the stored upper triangle to 0 (`perseus_ls_age_matrix.sv:L29`, used at `L154`).|
+| `entry_v`            | `[AM_SIZE-1:0]`    | input     | Per-entry live/valid mask; masked into all `*_matrix_eff_hold/set` terms (`perseus_ls_age_matrix.sv:L31`, used `L176–L188`). |
+| `entry_needs_arb`    | `[AM_SIZE-1:0]`    | input     | Per-entry predicate "this entry still wants to arbitrate"; gates `matrix_eff_*` for the primary `oldest_entry` cone (`perseus_ls_age_matrix.sv:L32`, used `L176–L180, L183–L187`). |
+| `entry_awaiting_resp`| `[AM_SIZE-1:0]`    | input     | Per-entry predicate for the `resp_*` cone; gates `resp_matrix_eff_*` (`perseus_ls_age_matrix.sv:L33`, used `L181, L188`).|
+| `entry_group_a`      | `[AM_SIZE-1:0]`    | input     | Class predicate for `group_a_oldest_entry` cone (`perseus_ls_age_matrix.sv:L34`, used `L177, L184`).                    |
+| `entry_group_b`      | `[AM_SIZE-1:0]`    | input     | Class predicate for `group_b_oldest_entry` cone (`perseus_ls_age_matrix.sv:L35`, used `L178, L185`).                    |
+| `entry_group_c`      | `[AM_SIZE-1:0]`    | input     | Class predicate for `group_c_oldest_entry` cone (`perseus_ls_age_matrix.sv:L36`, used `L179, L186`).                    |
+| `entry_group_d`      | `[AM_SIZE-1:0]`    | input     | Class predicate for `group_d_oldest_entry` cone (`perseus_ls_age_matrix.sv:L37`, used `L180, L187`).                    |
+| `src0_alloc_entry`   | `[AM_SIZE-1:0]`    | input     | 1-hot (caller contract) allocation row selected by source port 0; drives row/column update (`perseus_ls_age_matrix.sv:L38`, used `L106, L138–L139`). |
+| `src1_alloc_entry`   | `[AM_SIZE-1:0]`    | input     | 1-hot allocation from source port 1 (`perseus_ls_age_matrix.sv:L39`, used `L107, L140–L141`).                           |
+| `src2_alloc_entry`   | `[AM_SIZE-1:0]`    | input     | 1-hot allocation from source port 2 (`perseus_ls_age_matrix.sv:L40`, used `L108, L142–L143`).                           |
+| `src3_alloc_entry`   | `[AM_SIZE-1:0]`    | input     | 1-hot allocation from source port 3 (`perseus_ls_age_matrix.sv:L41`, used `L109, L144–L145`).                           |
+| `src0_older`         | `[3:0]`            | input     | Cross-port relative-age hints for source 0: bit `k` = "src0 is older than src`k`". Bits `[0]` and the diagonal are unread; bits `[1:3]` are consumed at `L113–L115` (`perseus_ls_age_matrix.sv:L42`). |
+| `src1_older`         | `[3:0]`            | input     | Cross-port hints for source 1: bits `[0],[2],[3]` consumed at `L118–L120` (`perseus_ls_age_matrix.sv:L43`).              |
+| `src2_older`         | `[3:0]`            | input     | Cross-port hints for source 2: bits `[0],[1],[3]` consumed at `L123–L125` (`perseus_ls_age_matrix.sv:L44`).              |
+| `src3_older`         | `[3:0]`            | input     | Cross-port hints for source 3: bits `[0],[1],[2]` consumed at `L128–L130` (`perseus_ls_age_matrix.sv:L45`).              |
+
+### §4.2 Output ports
+
+| Name                    | Width              | Direction | Role                                                                                                                |
+|-------------------------|--------------------|-----------|---------------------------------------------------------------------------------------------------------------------|
+| `oldest_entry`          | `[AM_SIZE-1:0]`    | output    | 1-hot oldest among `entry_v ∧ entry_needs_arb` (`perseus_ls_age_matrix.sv:L47`, driven at `L200, L219, L239`).      |
+| `group_a_oldest_entry`  | `[AM_SIZE-1:0]`    | output    | 1-hot oldest among `entry_v ∧ entry_needs_arb ∧ entry_group_a` (`perseus_ls_age_matrix.sv:L48`, driven at `L201, L220, L240`). |
+| `group_b_oldest_entry`  | `[AM_SIZE-1:0]`    | output    | 1-hot oldest among `entry_v ∧ entry_needs_arb ∧ entry_group_b` (`perseus_ls_age_matrix.sv:L49`, driven at `L202, L221, L241`). |
+| `group_c_oldest_entry`  | `[AM_SIZE-1:0]`    | output    | 1-hot oldest among `entry_v ∧ entry_needs_arb ∧ entry_group_c` (`perseus_ls_age_matrix.sv:L50`, driven at `L203, L222, L242`). |
+| `group_d_oldest_entry`  | `[AM_SIZE-1:0]`    | output    | 1-hot oldest among `entry_v ∧ entry_needs_arb ∧ entry_group_d` (`perseus_ls_age_matrix.sv:L51`, driven at `L204, L223, L243`). |
+| `resp_oldest_entry`     | `[AM_SIZE-1:0]`    | output    | 1-hot oldest among `entry_v ∧ entry_awaiting_resp` (`perseus_ls_age_matrix.sv:L52`, driven at `L205, L224, L244`). |
+
+(UNVERIFIED: the convention that `src_k_older[k]` — the self-bit on the diagonal —
+is unread is inferred from inspecting `L112–L130`: each `src_k_entry_v_eff`
+only reads `src_k_older[j]` for `j ≠ k`. The RTL neither reads nor constrains
+the diagonal bits, so callers MAY leave them tied to any constant without
+affecting behaviour. Not cross-checked against synthesis / formal lint in this
+task.)
+
+**Evidence.** Module header and full port list: `perseus_ls_age_matrix.sv:L26–L54`.
+
+---
+
+## §5 Key Circuit — Layer-by-Layer Walkthrough
+
+The datapath decomposes into five strictly pipelined (combinational or flopped)
+layers. Each sub-section below gives (a) the layer's purpose in one sentence,
+(b) the verbatim RTL excerpt, (c) an operational explanation of every line,
+and (d) the micro-architectural "why" that justifies the chosen structure.
+
+### §5.1 Layer 1 — Effective Valid Computation (L106–L130)
+
+**Purpose.** Compute, *per source port k*, the mask of entries that
+port `k` considers "already older than the entry I am allocating this
+cycle". This mask fuses two populations: pre-existing live entries
+(minus anything being re-allocated on top of them) and *other* source
+ports' concurrent allocations that the cross-port hints declare older
+than port `k`.
+
+```systemverilog
+// perseus_ls_age_matrix.sv:L106–L130
+  assign alloc_entry[AM_SIZE-1:0] =   src0_alloc_entry[AM_SIZE-1:0]
+                                    | src1_alloc_entry[AM_SIZE-1:0]
+                                    | src2_alloc_entry[AM_SIZE-1:0]
+                                    | src3_alloc_entry[AM_SIZE-1:0];
+
+
+  assign src0_entry_v_eff[AM_SIZE-1:0] =   (entry_v[AM_SIZE-1:0] & ~alloc_entry[AM_SIZE-1:0])
+                                         | ({AM_SIZE{~src0_older[1]}} & src1_alloc_entry[AM_SIZE-1:0])
+                                         | ({AM_SIZE{~src0_older[2]}} & src2_alloc_entry[AM_SIZE-1:0])
+                                         | ({AM_SIZE{~src0_older[3]}} & src3_alloc_entry[AM_SIZE-1:0]);
+
+  assign src1_entry_v_eff[AM_SIZE-1:0] =   (entry_v[AM_SIZE-1:0] & ~alloc_entry[AM_SIZE-1:0])
+                                         | ({AM_SIZE{~src1_older[0]}} & src0_alloc_entry[AM_SIZE-1:0])
+                                         | ({AM_SIZE{~src1_older[2]}} & src2_alloc_entry[AM_SIZE-1:0])
+                                         | ({AM_SIZE{~src1_older[3]}} & src3_alloc_entry[AM_SIZE-1:0]);
+
+  assign src2_entry_v_eff[AM_SIZE-1:0] =   (entry_v[AM_SIZE-1:0] & ~alloc_entry[AM_SIZE-1:0])
+                                         | ({AM_SIZE{~src2_older[0]}} & src0_alloc_entry[AM_SIZE-1:0])
+                                         | ({AM_SIZE{~src2_older[1]}} & src1_alloc_entry[AM_SIZE-1:0])
+                                         | ({AM_SIZE{~src2_older[3]}} & src3_alloc_entry[AM_SIZE-1:0]);
+
+  assign src3_entry_v_eff[AM_SIZE-1:0] =   (entry_v[AM_SIZE-1:0] & ~alloc_entry[AM_SIZE-1:0])
+                                         | ({AM_SIZE{~src3_older[0]}} & src0_alloc_entry[AM_SIZE-1:0])
+                                         | ({AM_SIZE{~src3_older[1]}} & src1_alloc_entry[AM_SIZE-1:0])
+                                         | ({AM_SIZE{~src3_older[2]}} & src2_alloc_entry[AM_SIZE-1:0]);
+```
+
+**What.** `alloc_entry` (`L106–L109`) is the OR-fold of all four
+source ports' 1-hot allocation vectors — the bitmask of rows being
+written this cycle from *any* port. The four `src*_entry_v_eff`
+signals (`L112–L130`) then each compute a port-specific "entries older
+than mine" mask: start from all currently-live entries except those
+being overwritten, then add in the concurrent allocations from *other*
+ports whose `src_k_older[j]` hint says port `j`'s new entry is older
+than port `k`'s.
+
+**How — pairwise consistency trick.** For each ordered pair (k,j) with
+k≠j, the hint bit `src_k_older[j]` appears exactly once in `src_k_entry_v_eff`
+(gating `srcj_alloc_entry` into port k's "older" set). Its complement
+`src_j_older[k]` — required by the caller contract (§6) to equal
+`~src_k_older[j]` — appears exactly once in `src_j_entry_v_eff` (gating
+`srck_alloc_entry` into port j's "older" set). This ensures the
+diagonal pair `(L113 bit[1])` vs `(L118 bit[0])`, `(L114 bit[2])` vs
+`(L123 bit[0])`, … always place each cross-port allocation into
+*exactly one* of the two involved `src*_entry_v_eff` masks, preserving
+matrix antisymmetry across the four-way concurrent-alloc event.
+
+**Why 4-way concurrent allocation.** The LSU issues up to four new
+LRQ/SAB/RAR entries per cycle (one per pipe). The age matrix must
+settle the total order among these four *and* against the already-live
+pool in the same cycle, because the oldest-query consumers read
+`oldest_entry` combinationally the cycle after allocation. A
+centralized age counter would serialize this; the 4-way fan-in here
+lets each port present its own "I am younger than these neighbours"
+hint, and the pairwise-consistency invariant makes the resulting row
+writes agree.
+
+### §5.2 Layer 2 — `age_matrix_in` Combinational Update (L137–L146)
+
+**Purpose.** For each strict-upper-triangle cell `[row][col]`, select
+this cycle's new value as one of nine choices: "new entry written to
+row by source k, so copy the k-th effective-valid bit at col", "new
+entry written to col by source k, so force the complement", or — if
+no allocation touches row or col — hold the flop value.
+
+```systemverilog
+// perseus_ls_age_matrix.sv:L137–L146
+     assign age_matrix_in[row][col] =
+                                      src0_alloc_entry[row] ?  src0_entry_v_eff[col]         :
+                                      src0_alloc_entry[col] ? ~src0_entry_v_eff[row]         :
+                                      src1_alloc_entry[row] ?  src1_entry_v_eff[col]         :
+                                      src1_alloc_entry[col] ? ~src1_entry_v_eff[row]         :
+                                      src2_alloc_entry[row] ?  src2_entry_v_eff[col]         :
+                                      src2_alloc_entry[col] ? ~src2_entry_v_eff[row]         :
+                                      src3_alloc_entry[row] ?  src3_entry_v_eff[col]         :
+                                      src3_alloc_entry[col] ? ~src3_entry_v_eff[row]         :
+                                                                      age_matrix_q[row][col]  ;
+```
+
+**What.** A cascade of eight ternaries selects the next-state of cell
+`[row][col]` (only defined for `col > row`, per the `if(col > row)`
+guard at `L135`). The nine outcomes in order of priority: (1) src0
+allocates into `row` → cell := `src0_entry_v_eff[col]` meaning "my
+new entry at row is younger than whatever sits at col iff col is in
+port 0's older set"; (2) src0 allocates into `col` → cell :=
+`~src0_entry_v_eff[row]` meaning "new entry at col is younger than
+entry at row iff row is NOT in port 0's older set"; (3–4) same for
+src1; (5–6) src2; (7–8) src3; (9) hold previous value.
+
+**How — priority encoding.** The cascade is a strict priority encoder
+src0 > src1 > src2 > src3 > hold. It is *safe* because the caller
+contract (§6) guarantees that at most one of the four `src*_alloc_entry`
+vectors has a 1 in any given bit position — so at most one of
+cases (1/2), (3/4), (5/6), (7/8) can fire for any `(row, col)` cell,
+and the apparent priority is operationally a parallel 4-way mux. The
+remaining (row-vs-col) ambiguity within a single source is also
+one-hot by contract (a source allocates into exactly one row per cycle).
+
+**Why.** Encoding this as a priority cascade rather than an OR-reduction
+is (a) strictly smaller at synthesis — 8 muxes chained beats a 9-way
+OR with decode logic — and (b) matches the natural one-hot case: the
+first arm that fires *is* the answer, so downstream arms are don't-cares.
+The fall-through to `age_matrix_q[row][col]` on the final line
+implements the row-level clock-gating contract from Layer 3: if no
+source touches row or col, the flop loads its own output and nothing
+observable changes.
+
+### §5.3 Layer 3 — Flop Storage with Row Clock-Gating (L149–L168)
+
+**Purpose.** Latch `age_matrix_in[row][*]` into `age_matrix_q[row][*]`
+on the positive clock edge, but only for rows whose contents can
+actually change this cycle, saving power on idle rows.
+
+```systemverilog
+// perseus_ls_age_matrix.sv:L149–L168
+  assign matrix_row_en[row] = alloc_entry[row] | (|alloc_entry[AM_SIZE-1:row+1]);
+
+
+  always_ff @(posedge clk or posedge reset_i)
+  begin: u_age_matrix_q_row_am_size_1_row_1
+    if (reset_i == 1'b1)
+      age_matrix_q[row][(AM_SIZE-1):(row+1)] <= `PERSEUS_DFF_DELAY {(((AM_SIZE-1))-((row+1))+1){1'b0}};
+`ifdef PERSEUS_XPROP_FLOP
+    else if (reset_i == 1'b0 && matrix_row_en[row] == 1'b1)
+      age_matrix_q[row][(AM_SIZE-1):(row+1)] <= `PERSEUS_DFF_DELAY age_matrix_in[row][(AM_SIZE-1):(row+1)];
+    else if (reset_i == 1'b0 && matrix_row_en[row] == 1'b0)
+    begin
+    end
+    else
+      age_matrix_q[row][(AM_SIZE-1):(row+1)] <= `PERSEUS_DFF_DELAY {(((AM_SIZE-1))-((row+1))+1){1'bx}};
+`else
+    else if (matrix_row_en[row] == 1'b1)
+      age_matrix_q[row][(AM_SIZE-1):(row+1)] <= `PERSEUS_DFF_DELAY age_matrix_in[row][(AM_SIZE-1):(row+1)];
+`endif
+  end
+```
+
+**What.** `matrix_row_en[row]` (L149) asserts whenever *either* the
+row itself is being allocated (`alloc_entry[row]`) *or* any higher-
+indexed row is being allocated (`|alloc_entry[AM_SIZE-1:row+1]`) —
+the latter because allocating into column `col > row` rewrites cell
+`[row][col]`, which lives in this row's flop slice. The `always_ff`
+block then implements: async reset clears the slice to 0; if XPROP
+guarding is enabled, a clean `row_en=1` loads `age_matrix_in`, a
+clean `row_en=0` holds, and any unknown on the enable injects X into
+the slice; otherwise (plain build) only the `row_en=1` case is coded,
+leaving the flop implicit-hold on `row_en=0`.
+
+**How — row-level clock-gate.** `matrix_row_en[row]` is the clock-gate
+enable term: only rows with a live write requirement toggle this cycle.
+The "higher-indexed" term is needed because of the upper-triangular
+storage: row `r` owns cells `[r][r+1..N-1]`, and a write to column
+`col` (via a source alloc hitting col) lands in `age_matrix_q[r][col]`
+for every `r < col` — so every row below `col` must enable.
+
+**Why XPROP guard.** `PERSEUS_XPROP_FLOP` switches the model from
+two-state (RTL hold) to an explicit four-case: reset / enabled / held /
+else→X. The else→X arm catches cases where the synthesis-intended
+clock gate could glitch (enable is X); in simulation this propagates
+X into `age_matrix_q` and the downstream oldest cone, surfacing the
+bug as an X-prop miscompare rather than silent "same value" hold.
+(UNVERIFIED: `PERSEUS_DFF_DELAY` and `PERSEUS_XPROP_FLOP` are defined
+in `perseus_header.sv`/`perseus_ls_defines.sv` and not re-inspected in
+this task; the explanation reflects standard Perseus convention.)
+
+### §5.4 Layer 4 — Masked Effective Matrix (L176–L195)
+
+**Purpose.** For each of the six oldest-entry cones (primary +
+group_a..d + resp), fold that cone's class predicate into the stored
+age relation, producing a per-row "which later-indexed entries are
+strictly older than me, under this cone's mask?" term that the
+oldest-selector (Layer 5) reduces.
+
+```systemverilog
+// perseus_ls_age_matrix.sv:L176–L195
+  assign         matrix_eff_hold[row][AM_SIZE-1:row+1] = age_matrix_q[row][AM_SIZE-1:row+1] & entry_v[AM_SIZE-1:row+1] &     entry_needs_arb[AM_SIZE-1:row+1];
+  assign group_a_matrix_eff_hold[row][AM_SIZE-1:row+1] = age_matrix_q[row][AM_SIZE-1:row+1] & entry_v[AM_SIZE-1:row+1] &     entry_needs_arb[AM_SIZE-1:row+1] &  entry_group_a[AM_SIZE-1:row+1];
+  assign group_b_matrix_eff_hold[row][AM_SIZE-1:row+1] = age_matrix_q[row][AM_SIZE-1:row+1] & entry_v[AM_SIZE-1:row+1] &     entry_needs_arb[AM_SIZE-1:row+1] &  entry_group_b[AM_SIZE-1:row+1];
+  assign group_c_matrix_eff_hold[row][AM_SIZE-1:row+1] = age_matrix_q[row][AM_SIZE-1:row+1] & entry_v[AM_SIZE-1:row+1] &     entry_needs_arb[AM_SIZE-1:row+1] &  entry_group_c[AM_SIZE-1:row+1];
+  assign group_d_matrix_eff_hold[row][AM_SIZE-1:row+1] = age_matrix_q[row][AM_SIZE-1:row+1] & entry_v[AM_SIZE-1:row+1] &     entry_needs_arb[AM_SIZE-1:row+1] &  entry_group_d[AM_SIZE-1:row+1];
+  assign    resp_matrix_eff_hold[row][AM_SIZE-1:row+1] = age_matrix_q[row][AM_SIZE-1:row+1] & entry_v[AM_SIZE-1:row+1] & entry_awaiting_resp[AM_SIZE-1:row+1];
+
+  assign         matrix_eff_set[row][AM_SIZE-1:row+1] = {AM_SIZE-row-1{~entry_v[row]}} | {AM_SIZE-row-1{~entry_needs_arb[row]}};
+  assign group_a_matrix_eff_set[row][AM_SIZE-1:row+1] = {AM_SIZE-row-1{~entry_v[row]}} | {AM_SIZE-row-1{~entry_needs_arb[row]}} | {AM_SIZE-row-1{~entry_group_a[row]}};
+  assign group_b_matrix_eff_set[row][AM_SIZE-1:row+1] = {AM_SIZE-row-1{~entry_v[row]}} | {AM_SIZE-row-1{~entry_needs_arb[row]}} | {AM_SIZE-row-1{~entry_group_b[row]}};
+  assign group_c_matrix_eff_set[row][AM_SIZE-1:row+1] = {AM_SIZE-row-1{~entry_v[row]}} | {AM_SIZE-row-1{~entry_needs_arb[row]}} | {AM_SIZE-row-1{~entry_group_c[row]}};
+  assign group_d_matrix_eff_set[row][AM_SIZE-1:row+1] = {AM_SIZE-row-1{~entry_v[row]}} | {AM_SIZE-row-1{~entry_needs_arb[row]}} | {AM_SIZE-row-1{~entry_group_d[row]}};
+  assign    resp_matrix_eff_set[row][AM_SIZE-1:row+1] = {AM_SIZE-row-1{~entry_v[row]}} | {AM_SIZE-row-1{~entry_awaiting_resp[row]}};
+
+  assign         matrix_eff[row][AM_SIZE-1:row+1] =         matrix_eff_set[row][AM_SIZE-1:row+1] |         matrix_eff_hold[row][AM_SIZE-1:row+1];
+  assign group_a_matrix_eff[row][AM_SIZE-1:row+1] = group_a_matrix_eff_set[row][AM_SIZE-1:row+1] | group_a_matrix_eff_hold[row][AM_SIZE-1:row+1];
+  assign group_b_matrix_eff[row][AM_SIZE-1:row+1] = group_b_matrix_eff_set[row][AM_SIZE-1:row+1] | group_b_matrix_eff_hold[row][AM_SIZE-1:row+1];
+  assign group_c_matrix_eff[row][AM_SIZE-1:row+1] = group_c_matrix_eff_set[row][AM_SIZE-1:row+1] | group_c_matrix_eff_hold[row][AM_SIZE-1:row+1];
+  assign group_d_matrix_eff[row][AM_SIZE-1:row+1] = group_d_matrix_eff_set[row][AM_SIZE-1:row+1] | group_d_matrix_eff_hold[row][AM_SIZE-1:row+1];
+  assign    resp_matrix_eff[row][AM_SIZE-1:row+1] =    resp_matrix_eff_set[row][AM_SIZE-1:row+1] |    resp_matrix_eff_hold[row][AM_SIZE-1:row+1];
+```
+
+**What — hold vs set decomposition.** For each cone X, the effective
+row slice `X_matrix_eff[row][col]` is a Boolean OR of two terms:
+- `X_matrix_eff_hold[row][col]` — "col is a live cone-member older
+  than row" (the raw relation ANDed with col-side cone predicates);
+- `X_matrix_eff_set[row][col]` — "row itself is not a cone-member,
+  so force the cell to 1 (treat col as trivially older so row can
+  never be oldest in this cone)".
+
+For the primary cone (`matrix_eff`, L176/L183/L190), the cone mask is
+`entry_v ∧ entry_needs_arb`. For the four class groups, an extra
+`entry_group_{a..d}` bit enters both the hold (AND on col) and the
+set (OR on `~group[row]`) terms. For `resp_*`, the mask is
+`entry_v ∧ entry_awaiting_resp` and `needs_arb` drops out.
+
+**How — six parallel variants.** Lines L176–L181 build the six
+`_hold` terms; L183–L188 build the six `_set` terms; L190–L195 OR
+them into `_eff`. Six cones × three intermediate signals × per-row
+generate = the six cones run as totally independent datapath copies
+from here on. There is no sharing below Layer 3.
+
+**Why the hold/set split.** The oldest-selector at Layer 5 computes
+`oldest[row] = ~|eff[row][row+1:]` & `&eff_col[row][:row-1]` — a row
+of zeros AND a column of ones. The `_set` term fires the "column of
+ones" discipline from the row's own side: by forcing `eff[row][col]=1`
+whenever `row` is not a cone-member, the cone simply cannot select
+`row` as oldest (its row-zero reduction will be falsified). This
+folds the cone predicate into the relation itself rather than AND-ing
+the final `oldest_entry[row]` with `cone_mask[row]`, which is equivalent
+but adds a layer of gating after an already long reduction tree.
+
+### §5.5 Layer 5 — Oldest-Entry Selector (L200–L244)
+
+**Purpose.** Reduce each cone's effective matrix into a 1-hot
+`*_oldest_entry[N]` output vector via the row-of-zeros ∧ column-of-ones
+query per row.
+
+```systemverilog
+// perseus_ls_age_matrix.sv:L200–L244
+  assign         oldest_entry[0] = ~(|        matrix_eff[0][AM_SIZE-1:1]);
+  assign group_a_oldest_entry[0] = ~(|group_a_matrix_eff[0][AM_SIZE-1:1]);
+  assign group_b_oldest_entry[0] = ~(|group_b_matrix_eff[0][AM_SIZE-1:1]);
+  assign group_c_oldest_entry[0] = ~(|group_c_matrix_eff[0][AM_SIZE-1:1]);
+  assign group_d_oldest_entry[0] = ~(|group_d_matrix_eff[0][AM_SIZE-1:1]);
+  assign    resp_oldest_entry[0] = ~(|   resp_matrix_eff[0][AM_SIZE-1:1]);
+generate
+ for(row=1; row<AM_SIZE-1; row=row+1) begin : matrix_eff_inverse_row
+   for(z=0; z<AM_SIZE-2; z=z+1) begin : matrix_eff_inverse_z
+    if(z < row) begin : z_less_than_row
+      assign         matrix_eff_col[row][z] =         matrix_eff[z][row];
+      assign group_a_matrix_eff_col[row][z] = group_a_matrix_eff[z][row];
+      assign group_b_matrix_eff_col[row][z] = group_b_matrix_eff[z][row];
+      assign group_c_matrix_eff_col[row][z] = group_c_matrix_eff[z][row];
+      assign group_d_matrix_eff_col[row][z] = group_d_matrix_eff[z][row];
+      assign    resp_matrix_eff_col[row][z] =    resp_matrix_eff[z][row];
+    end
+
+   end
+  assign         oldest_entry[row] = ~(|        matrix_eff[row][AM_SIZE-1:row+1]) & (&        matrix_eff_col[row][row-1:0]);
+  assign group_a_oldest_entry[row] = ~(|group_a_matrix_eff[row][AM_SIZE-1:row+1]) & (&group_a_matrix_eff_col[row][row-1:0]);
+  assign group_b_oldest_entry[row] = ~(|group_b_matrix_eff[row][AM_SIZE-1:row+1]) & (&group_b_matrix_eff_col[row][row-1:0]);
+  assign group_c_oldest_entry[row] = ~(|group_c_matrix_eff[row][AM_SIZE-1:row+1]) & (&group_c_matrix_eff_col[row][row-1:0]);
+  assign group_d_oldest_entry[row] = ~(|group_d_matrix_eff[row][AM_SIZE-1:row+1]) & (&group_d_matrix_eff_col[row][row-1:0]);
+  assign    resp_oldest_entry[row] = ~(|   resp_matrix_eff[row][AM_SIZE-1:row+1]) & (&   resp_matrix_eff_col[row][row-1:0]);
+
+ end
+endgenerate
+
+generate
+ for(z=0; z<AM_SIZE-1; z=z+1) begin : matrix_eff_inverse_last_row
+  assign         matrix_eff_col[AM_SIZE-1][z] =         matrix_eff[z][AM_SIZE-1];
+  assign group_a_matrix_eff_col[AM_SIZE-1][z] = group_a_matrix_eff[z][AM_SIZE-1];
+  assign group_b_matrix_eff_col[AM_SIZE-1][z] = group_b_matrix_eff[z][AM_SIZE-1];
+  assign group_c_matrix_eff_col[AM_SIZE-1][z] = group_c_matrix_eff[z][AM_SIZE-1];
+  assign group_d_matrix_eff_col[AM_SIZE-1][z] = group_d_matrix_eff[z][AM_SIZE-1];
+  assign    resp_matrix_eff_col[AM_SIZE-1][z] =    resp_matrix_eff[z][AM_SIZE-1];
+ end
+endgenerate
+  assign         oldest_entry[AM_SIZE-1] =                                        (&        matrix_eff_col[AM_SIZE-1][AM_SIZE-2:0]);
+  assign group_a_oldest_entry[AM_SIZE-1] =                                        (&group_a_matrix_eff_col[AM_SIZE-1][AM_SIZE-2:0]);
+  assign group_b_oldest_entry[AM_SIZE-1] =                                        (&group_b_matrix_eff_col[AM_SIZE-1][AM_SIZE-2:0]);
+  assign group_c_oldest_entry[AM_SIZE-1] =                                        (&group_c_matrix_eff_col[AM_SIZE-1][AM_SIZE-2:0]);
+  assign group_d_oldest_entry[AM_SIZE-1] =                                        (&group_d_matrix_eff_col[AM_SIZE-1][AM_SIZE-2:0]);
+  assign    resp_oldest_entry[AM_SIZE-1] =                                        (&   resp_matrix_eff_col[AM_SIZE-1][AM_SIZE-2:0]);
+```
+
+**What — three row-class cases.**
+- **Row 0** (L200–L205): has no column to its left (there is no row
+  with smaller index), so the column-of-ones conjunct collapses. Only
+  the row-of-zeros reduction over `matrix_eff[0][AM_SIZE-1:1]` is
+  needed; its complement directly drives `oldest_entry[0]`.
+- **Interior rows `1 ≤ row ≤ AM_SIZE-2`** (L207–L226): two
+  generate loops. The inner loop (z < row) transposes the z-th
+  column of the stored triangle into `matrix_eff_col[row][z]` by
+  reading `matrix_eff[z][row]` (the upper-triangle flop cell that
+  encodes the i=z vs j=row relation). The row's oldest test at
+  L219 then combines `~|matrix_eff[row][row+1:]` (row zero) with
+  `&matrix_eff_col[row][row-1:0]` (column one) for each of the six
+  cones.
+- **Row AM_SIZE-1** (L229–L244): has no row-of-zeros term (there
+  is no column to its right), so only the column-of-ones conjunct
+  remains. The generate at L229–L238 populates the whole
+  `matrix_eff_col[AM_SIZE-1][0:AM_SIZE-2]` by transposing column
+  `AM_SIZE-1` of each stored row.
+
+**How — column-from-transpose.** The antisymmetric relation means
+the "lower triangle" entries are just the inverses of the stored
+upper-triangle entries, *but the four Layer-4 `_eff` variants already
+contain the correct sense including the set-to-1 force* — so the
+column read is a direct copy of `matrix_eff[z][row]`, not a negation.
+The resulting `matrix_eff_col` array provides the `&` conjunct in
+one-cycle combinational depth. The `if(z < row)` guard at L209
+prevents generate loops from instantiating the above-diagonal half
+of `matrix_eff_col`, which is unused.
+
+**Why — fan-in scaling.** For row `r`, the oldest reduction is an
+OR tree of width `N-1-r` and an AND tree of width `r`, fan-in ~N per
+row. Total gate count is O(N²) per cone × 6 cones = O(6N²), same as
+the storage cost. Critical path depth is one OR-tree + one AND-tree
++ one gate ≈ `ceil(log2(N))` levels — at AM_SIZE=16 this is 4 levels
+of 2-input gates, easily fitting one cycle. The split into three
+row-classes is a pure readability/lint optimization; a single
+generate covering row 0..N-1 with conditional corner-case guards
+would synthesize to the same logic.
+
+---
+
+## §6 Caller Contract
+
+Callers that instantiate `perseus_ls_age_matrix` MUST satisfy the
+following assumptions. Violations do not cause synthesis errors but
+will silently corrupt the ordering relation and yield wrong
+`*_oldest_entry` outputs.
+
+### §6.1 Required invariants
+
+1. **Pairwise-consistent cross-port age hints.** For every ordered
+   pair of source ports `k ≠ j`, the caller MUST drive
+   `src_k_older[j] = ~src_j_older[k]`. Without this, the four
+   `src*_entry_v_eff` masks at `perseus_ls_age_matrix.sv:L112–L130`
+   disagree on which of the two concurrent allocations is older, and
+   the row/column writes in `age_matrix_in` (L137–L146) emit an
+   *asymmetric* age-matrix that no longer satisfies
+   `A[i][j] + A[j][i] = 1`. Downstream, the row-of-zeros and
+   column-of-ones reductions (L200–L244) can then both succeed for
+   multiple rows, producing non-1-hot `oldest_entry`.
+
+2. **At most one source allocates into any given row per cycle.**
+   I.e. for every bit position `r`,
+   `sum(src0_alloc_entry[r], src1_alloc_entry[r], src2_alloc_entry[r], src3_alloc_entry[r]) ≤ 1`.
+   This is what makes the priority cascade at `perseus_ls_age_matrix.sv:L137–L146`
+   behave as a parallel 4-way mux instead of a true priority encoder:
+   only one arm fires per cell, so the src0>src1>src2>src3 ordering is
+   never observed in practice.
+
+3. **Each `src_k_alloc_entry` is 0 or 1-hot.** A given source port
+   writes at most one entry per cycle. Multi-hot would cause the
+   row-enable term `matrix_row_en[row] = alloc_entry[row] | (|alloc_entry[row+1:])`
+   at `perseus_ls_age_matrix.sv:L149` to still be correct, but the
+   `age_matrix_in` cascade would write *multiple* rows from the same
+   source port with cross-row `src_k_entry_v_eff` values that only
+   make sense for a single new entry.
+
+4. **Un-used source ports are tied to zero.** A caller with fewer
+   than four allocation sources MUST drive the unused
+   `src_k_alloc_entry` to all zeros (and MAY leave the unused
+   `src_k_older` bits at any value — they are masked out by the
+   zero alloc vector at `L113–L130`).
+
+5. **Class predicates need not be mutually exclusive.** `entry_group_a`,
+   `entry_group_b`, `entry_group_c`, `entry_group_d` are independently
+   consumed by six separate effective-matrix cones at L176–L195; an
+   entry MAY be in zero, one, or multiple groups simultaneously. The
+   only constraint is that a group-mask bit should be 0 for dead
+   entries (where `entry_v` is 0), but this is also enforced by the
+   `entry_v` AND at L176–L181.
+
+6. **Degenerate size `AM_SIZE=1` is unsupported.** The `for(row=0; row<AM_SIZE-1; ...)`
+   generate loops at L133, L175, L207 produce empty bodies when
+   `AM_SIZE=1`, leaving `age_matrix_q` declared but never assigned.
+   The final `oldest_entry[0]` assignment at L200 reads
+   `matrix_eff[0][AM_SIZE-1:1]` which is a backward/null range for
+   `AM_SIZE=1` and will not elaborate cleanly. (UNVERIFIED: the RTL
+   does not contain an explicit `AM_SIZE > 1` assertion; inferred
+   from the loop bounds.)
+
+### §6.2 Potential pitfalls in caller code
+
+- **Unused-source alloc forgotten at reset.** If a caller has only
+  two real alloc sources and leaves `src2_alloc_entry` / `src3_alloc_entry`
+  at X (e.g. uninitialised flop output), the cascade at
+  `perseus_ls_age_matrix.sv:L137–L146` will propagate X into every
+  upper-triangle cell on every cycle. Always tie unused source ports
+  to `{AM_SIZE{1'b0}}` in the instantiation.
+
+- **`entry_v[r]=1` but no `src_k_alloc_entry[r]` ever asserted.**
+  If a consumer allocates by a path that bypasses the age matrix
+  (e.g. a retry queue that sets `entry_v` directly), the row's
+  `age_matrix_q[r][r+1:]` flops remain in their reset-zero state,
+  and the row-of-zeros oldest test will declare `r` oldest even
+  when older entries exist in higher rows. Every entry that
+  participates in age ordering MUST have been allocated via one of
+  the four `src_k_alloc_entry` ports.
+
+- **Same-cycle read of `oldest_entry` and new alloc.** The age
+  matrix has one-cycle allocation latency: `src_k_alloc_entry` is
+  consumed combinationally by `age_matrix_in` (L137–L146) but is
+  stored into `age_matrix_q` only on the next posedge (L152). The
+  same-cycle `*_oldest_entry` at L200–L244 reads `matrix_eff` which
+  reads `age_matrix_q` — i.e. the *previous* cycle's relation.
+  Callers that need "include the entry I am allocating this cycle
+  in the oldest query" must either pre-merge by adjusting `entry_v`
+  and the cone masks, or accept one-cycle latency. See §7
+  (deferred) for how `ls_lrq` handles this at the instantiation
+  site.
+
+- **Stale `src_k_older` when `src_k_alloc_entry == 0`.** If a
+  caller drives a non-zero `src_k_older` hint while keeping
+  `src_k_alloc_entry = 0` (no allocation), the hint is harmless —
+  it ANDs with zero at L113/L114/… — but indicates confused control
+  logic. The canonical pattern is "drive both or neither".
+
+**Evidence.** Port list and cross-port hint widths:
+`perseus_ls_age_matrix.sv:L38–L45`. One-hot consumption sites:
+`perseus_ls_age_matrix.sv:L106–L109` (OR-fold), `L137–L146`
+(priority cascade). Row-enable: `perseus_ls_age_matrix.sv:L149`.
+Allocation latency: `perseus_ls_age_matrix.sv:L152–L168` vs
+`L200–L244`.
+
+---
+
+<!-- §7–§8 to be written in Task 6 (Gate 5) -->
+<!-- §7: ls_lrq instantiation context (AM_SIZE=16, port binding, surrounding logic, waveform illustration) -->
+<!-- §8: summary / primitive-reuse guidance across LSU pools -->
+
