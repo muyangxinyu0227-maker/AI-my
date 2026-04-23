@@ -85,8 +85,10 @@ Maintain a running coarse estimate throughout the session:
 session_tokens ≈ conversation_turns × 5K
                + cumulative_written_md_lines × 20
                + cumulative_RTL_lines_read × 15
-               + 30K baseline (system reminders + spec + plan persistent)
+               + 45K baseline (system reminders + skills listing + spec + plan persistent)
 ```
+
+**Note:** Trial run confirmed subagents start at ~45-55K due to system-reminder + skills-listing overhead (not 30K). Update baseline accordingly.
 
 Check at the start of every Task. **When `session_tokens / 200K ≥ 95%`** (i.e. ≥ 190K), pause and prompt the user:
 
@@ -106,7 +108,7 @@ Use the Agent tool with:
   1. Path to plan file: `/Users/m/claude code/lsu_ut/docs/superpowers/plans/2026-04-22-lsu-rtl-deep-dive-pilot.md` — with exact Task <N> number the subagent should execute
   2. Path to spec file: `/Users/m/claude code/lsu_ut/docs/superpowers/specs/design_spec/2026-04-22-lsu-rtl-deep-dive-design.md` — source of rules R1-R7
   3. Exact md file path to create or modify
-  4. SSH command template: `ssh 192.168.20.6 -l xy.mu "<cmd>"` for all RTL reads
+  4. SSH command template: `ssh -o ConnectTimeout=10 192.168.20.6 -l xy.mu "<cmd>"` for all RTL reads (ConnectTimeout prevents 75-second default TCP hang on network outage)
   5. If writing an L2 module: the 14-section structure from spec §5.1
   6. Instruction to return ONLY: {final md file path, summary of key judgments made, consolidated UNVERIFIED flags introduced, Ritual D gate report text}
   7. Subagent must NOT invoke `writing-plans`, `brainstorming`, or any other skill — it only executes the one Task given
@@ -116,15 +118,17 @@ Per-task **Step 1 always begins with Ritual 0** before any other action (estimat
 ### Ritual A: Read RTL over SSH
 
 ```bash
-ssh 192.168.20.6 -l xy.mu "cat -n /home/xy.mu/N2/MP128-r0p3-00rel0-2/MP128-BU-50000-r0p3-00rel0/perseus/logical/perseus_loadstore/verilog/<FILE>.sv"
+ssh -o ConnectTimeout=10 192.168.20.6 -l xy.mu "cat -n /home/xy.mu/N2/MP128-r0p3-00rel0-2/MP128-BU-50000-r0p3-00rel0/perseus/logical/perseus_loadstore/verilog/<FILE>.sv"
 ```
 
-Always use `cat -n` so line numbers are visible for citation (spec R3).
+Always use `cat -n` so line numbers are visible for citation (spec R3). Always include `-o ConnectTimeout=10` to fail fast on network outage (default TCP timeout is 75 seconds — wasteful on retries).
 
 For large files (`ls_lrq.sv` is 1.9MB), use line-range reads:
 ```bash
-ssh 192.168.20.6 -l xy.mu "sed -n '<START>,<END>p' /home/xy.mu/.../<FILE>.sv | cat -n"
+ssh -o ConnectTimeout=10 192.168.20.6 -l xy.mu "sed -n '<START>,<END>p' /home/xy.mu/.../<FILE>.sv | cat -n"
 ```
+
+**SSH prerequisite:** The remote `192.168.20.6` is on a private network; user may need to be on VPN. If SSH fails with "Operation timed out", stop and report to user — do not retry more than once.
 
 ### Ritual B: Self-check md content against spec rules R1-R7
 
@@ -167,6 +171,22 @@ After committing, post a message with:
 4. RTL files and line ranges consulted
 5. "Awaiting approval to proceed to Gate <N+1>"
 
+### Ritual E: Failure Protocol
+
+When a Step fails unexpectedly (SSH timeout, missing tool, command error, etc.):
+
+1. **Do NOT self-troubleshoot more than once.** Run the failing command once with a diagnostic variant (e.g. add `-v` or `ConnectTimeout`) and if that also fails, stop.
+
+2. **Check Step independence:** Is the failing Step a dependency of the remaining Steps in this Task?
+   - **Yes (dependency)**: stop immediately, mark remaining Steps SKIPPED, report.
+     Example: Step 2 (SSH verify) fails → Task 2+ depend on SSH reads, so stop.
+   - **No (independent)**: complete the remaining independent Steps, then report all results.
+     Example: Ritual A SSH test fails but Step N (purely local git commit) doesn't depend on it → run Step N.
+
+3. **Report in gate report:** Include under "发现的问题" the failure details, command output, and reasoning for what was/wasn't completed.
+
+4. **Never fabricate completion.** If a Step was SKIPPED because of upstream failure, say so explicitly — don't pretend the outputs exist.
+
 ---
 
 ## Task 1: Infrastructure Setup
@@ -192,11 +212,11 @@ Expected output: three subdirectories exist (`shared_primitives`, `submodules`, 
 - [ ] **Step 2: Verify SSH access to remote RTL**
 
 ```bash
-ssh 192.168.20.6 -l xy.mu "head -5 /home/xy.mu/N2/MP128-r0p3-00rel0-2/MP128-BU-50000-r0p3-00rel0/perseus/logical/perseus_loadstore/verilog/perseus_loadstore.sv"
+ssh -o ConnectTimeout=10 192.168.20.6 -l xy.mu "head -5 /home/xy.mu/N2/MP128-r0p3-00rel0-2/MP128-BU-50000-r0p3-00rel0/perseus/logical/perseus_loadstore/verilog/perseus_loadstore.sv"
 ```
 
 Expected: first 5 lines of the top-level LSU RTL print (ARM copyright header).
-If this fails: stop, troubleshoot SSH connectivity before proceeding.
+If this fails (likely "Operation timed out"): apply **Ritual E Failure Protocol** — do not retry more than once, but note that Step 5 (local git commit) does NOT depend on SSH, so complete it before reporting. User may need to connect VPN to reach `192.168.20.6`.
 
 - [ ] **Step 3: Verify docx npm module available**
 
