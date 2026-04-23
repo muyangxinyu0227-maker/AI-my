@@ -58,6 +58,61 @@ Files to be created across all tasks:
 
 ## Common Rituals (referenced by tasks below)
 
+### Ritual 0: Context Budget Check (MUST run before every Task's Step 1)
+
+Before starting any Task, compute the estimated context cost and decide execution mode. This prevents mid-Task context exhaustion, especially important when scaling this workflow to 20+ future L2 modules (some trivial, some heavy).
+
+**Formula:**
+
+```
+task_tokens ≈ RTL_lines_to_read × 15
+             + md_output_lines × 20
+             + 12K    (fixed: pre-announce + self-check + commit + gate report + ritual refs)
+```
+
+Constants chosen empirically: SV code ≈ 15 tok/line, mixed CN/EN md ≈ 20 tok/line, 12K fixed for Ritual B/C/D overhead.
+
+**Mode decision (single threshold = 100K):**
+
+- `task_tokens < 100K` → **Inline** (execute in main session)
+- `task_tokens ≥ 100K` → **Subagent** (dispatch via Agent tool — see Subagent Dispatch Spec below)
+
+**Main session budget tracking (simple approach):**
+
+Maintain a running coarse estimate throughout the session:
+
+```
+session_tokens ≈ conversation_turns × 5K
+               + cumulative_written_md_lines × 20
+               + cumulative_RTL_lines_read × 15
+               + 30K baseline (system reminders + spec + plan persistent)
+```
+
+Check at the start of every Task. **When `session_tokens / 200K ≥ 95%`** (i.e. ≥ 190K), pause and prompt the user:
+
+> "Main session at ~N% context usage (≈ NNNK / 200K). Options:
+>  (a) continue anyway (risk running out mid-Task)
+>  (b) start fresh session — I'll re-read spec + plan paths
+>  (c) compact conversation — summarize old turns into a brief and discard"
+
+Do NOT proceed to the Task's Step 1 without a user response at the 95% mark.
+
+**Subagent Dispatch Spec (when Ritual 0 selects Subagent mode):**
+
+Use the Agent tool with:
+- `description`: `"Task <N>: <short title>"` (e.g. `"Task 15: ls_lrq §7-8 clock/reset + key circuits"`)
+- `subagent_type`: `"general-purpose"`
+- `prompt`: self-contained, must include:
+  1. Path to plan file: `/Users/m/claude code/lsu_ut/docs/superpowers/plans/2026-04-22-lsu-rtl-deep-dive-pilot.md` — with exact Task <N> number the subagent should execute
+  2. Path to spec file: `/Users/m/claude code/lsu_ut/docs/superpowers/specs/design_spec/2026-04-22-lsu-rtl-deep-dive-design.md` — source of rules R1-R7
+  3. Exact md file path to create or modify
+  4. SSH command template: `ssh 192.168.20.6 -l xy.mu "<cmd>"` for all RTL reads
+  5. If writing an L2 module: the 14-section structure from spec §5.1
+  6. Instruction to return ONLY: {final md file path, summary of key judgments made, consolidated UNVERIFIED flags introduced, Ritual D gate report text}
+  7. Subagent must NOT invoke `writing-plans`, `brainstorming`, or any other skill — it only executes the one Task given
+
+Per-task **Step 1 always begins with Ritual 0** before any other action (estimation + mode selection + main-session-budget check).
+
 ### Ritual A: Read RTL over SSH
 
 ```bash
@@ -2044,6 +2099,64 @@ git push origin main
 
 ---
 
+## Appendix A: Per-Task Mode Estimate (pre-computed under 100K threshold)
+
+Estimates computed at plan-write time using Ritual 0 formula. Actual Task execution should re-check — real RTL read/md output may vary (Ritual 0 runs at the start of each Task regardless).
+
+| Task | Gate | RTL (lines) | md (lines) | Est tokens | Per-task Mode |
+|------|------|-------------|-----------|-----------|------|
+| 1 | — | 0 | 0 | 8K | Inline |
+| 2 | 1 | 1000 | 500 | 37K | Inline |
+| 3 | 2 | 0 | 300 | 18K | Inline |
+| 4 | 3 | 85 (cached) | 200 | 17K | Inline |
+| 5 | 4 | 170 (cached) | 400 | 23K | Inline |
+| 6 | 5 | grep only | 200 | 16K | Inline |
+| 7 | 6 | 800 | 400 | 32K | Inline |
+| 8 | 7 | 0 | 300 | 18K | Inline |
+| 9 | 8 | 500 | 500 | 30K | Inline |
+| 10 | 9 | 2000 | 800 | 58K | Inline |
+| 11 | 10 | 500 | 600 | 32K | Inline |
+| 12 | 11 | 1000 | 500 | 37K | Inline |
+| 13 | 12 | 200 | 300 | 21K | Inline |
+| 14 | 13 | 500 | 500 | 30K | Inline |
+| 15 | 14 | 3000 | 1000 | 77K | Inline (close to threshold) |
+| 16 | 15 | 1500 | 600 | 45K | Inline |
+| 17 | 16 | 2000 | 800 | 58K | Inline |
+| 18 | 17 | 300 | 500 | 26K | Inline |
+| 19 | 18 | 0 | 200 | 16K | Inline |
+| 20 | 19 | 0 | ~200 scripting | 20K | Inline |
+| 21 | 20 | 0 | 200 | 16K | Inline |
+
+**Per-task verdict:** Under the 100K single-task threshold, all 21 Tasks are pre-computed **Inline**. No individual gate breaks 100K.
+
+**Cumulative main-session trajectory** (coarse estimate, ignoring compaction):
+
+| Checkpoint | Cumulative tokens | 95% trigger? |
+|-----------|-------------------|--------------|
+| Start of execution | ~200K (already used by design spec + plan + this session's brainstorming) | ⚠️ already close |
+| After Task 1 | ~210K | likely fired |
+| After Task 5 | ~260K | definitely fired |
+| After Task 10 | ~370K | — |
+| After Task 15 | ~500K | — |
+| After Task 21 | ~650K | — |
+
+**Reality:** The 95% prompt will likely fire **before Task 1 starts** because the current session has accumulated a lot of brainstorming context. At that point user will choose:
+
+- **(a) continue** — risk running out; practically not viable past Task 3-5
+- **(b) fresh session** — recommended; new session starts at ~30K, plenty of headroom, Tasks all Inline
+- **(c) compact** — mid-option; preserves continuity, hands summary back, can continue Inline for several Tasks
+
+**Expected operating mode:** start a fresh session for execution (option b), then Inline all Tasks with 95% re-check between Tasks 10-15; only switch to Subagent if a specific Task's re-estimate crosses 100K or cumulative prompts fire repeatedly.
+
+**Future expansion note:** When this workflow is reused for other microarchitecture modules (per spec §11 Path α):
+- **Trivial modules** (e.g. `ls_age_compare.sv` 40 lines, `ls_stid_add.sv` 100 lines): whole module ~15K tokens, all Inline in one session, no gates needed.
+- **Medium modules** (e.g. `ls_wpt.sv` 500 lines, `ls_snoop_entry.sv`): per-gate ~20-40K, all Inline unless session budget tight.
+- **Heavy modules** (e.g. `ls_ldpipe_ctl.sv` 1.48MB, `ls_sab.sv` 1.2MB, `ls_fb.sv` 524KB): **some individual Tasks will cross 100K** → per-Task Subagent dispatch, main session stays light.
+
+Ritual 0 is the single gating mechanism; no special handling per module class.
+
+---
+
 ## Self-Review Notes (author-side pass)
 
 Applied the writing-plans self-review:
@@ -2068,8 +2181,18 @@ Coverage: complete.
 **3. Type consistency:**
 - Feature ID format `<MOD>-F<NN>` consistent across tasks
 - Module abbreviations consistent with spec §6.2
-- Ritual names (A/B/C/D) consistent
+- Ritual names (0/A/B/C/D) consistent — Ritual 0 (Context Budget) added at top, referenced in per-Task Step 1 via "always begins with Ritual 0"
 - File paths consistent (`/Users/m/claude code/lsu_ut/...` absolute throughout)
 - Ritual B refers to R1-R7 — all defined in spec §7; consistent
 
 No inconsistencies found.
+
+**4. Ritual 0 coverage (post-amendment):**
+- Ritual 0 defined with formula, threshold (100K), main-session tracking (95% trigger), and Subagent Dispatch Spec
+- Appendix A provides pre-computed per-Task estimates — all 21 Inline under 100K threshold
+- Appendix A documents expected main-session trajectory and the likely "start fresh session" decision at the outset
+- Per-Task Step 1 wording ("Pre-announce") is kept as-is but spec in Ritual 0 says "Step 1 always begins with Ritual 0" — executor must estimate + check before announcing
+
+**5. Reusability for future L2 modules:**
+- Appendix A §"Future expansion note" extends Ritual 0 applicability to trivial / medium / heavy module classes
+- No per-class special handling — Ritual 0 is the single gating mechanism
