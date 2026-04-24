@@ -700,47 +700,73 @@ Allocation latency: `perseus_ls_age_matrix.sv:L152–L168` vs
 
 ## §7 Instantiation Catalog
 
-This section enumerates *every* instantiation of `perseus_ls_age_matrix`
-in the LSU RTL release under inspection (`MP128-r0p3-00rel0-2 /
-MP128-BU-50000-r0p3-00rel0`), with each consumer's `AM_SIZE`, source-port
-wiring, class-group assignment, and role. The ground-truth list below was
-produced by `grep -rn 'perseus_ls_age_matrix'` over
-`perseus/logical/perseus_loadstore/verilog/` and inspecting 30 lines of
-context at every hit.
+This section enumerates age-matrix consumers along two parallel axes:
+(a) **spec intent** — the consumers named in the design spec, which
+represent the intended architecture; and (b) **current RTL snapshot** —
+the consumers that actually instantiate `perseus_ls_age_matrix` in the
+LSU RTL release under inspection (`MP128-r0p3-00rel0-2 /
+MP128-BU-50000-r0p3-00rel0`). Under the pilot rule that spec is
+authoritative and the RTL may be a pruned subset of spec, the two lists
+can legitimately differ without either being "wrong".
 
-### §7.1 Ground-truth catalog
+### §7.1 Spec §3 D5 intended consumers (spec intent — not realized in current RTL snapshot)
 
-| Consumer module    | `AM_SIZE` (resolved)                              | Instance name             | Source location                    | Role                                                                                 | Status in this pilot            |
-|--------------------|---------------------------------------------------|---------------------------|------------------------------------|--------------------------------------------------------------------------------------|---------------------------------|
-| `perseus_ls_fb`    | `16`                                              | `u_fb_age_matrix`         | `perseus_ls_fb.sv:L8526`           | Fill-Buffer oldest arbitration; per-L2-bank oldest (groups a–d = l2bank 0..3)        | **In-scope reference** (this doc, §1–§6) |
-| `perseus_ls_pf`    | `` `PERSEUS_LS_PF_TRAIN_BUFFER_SIZE `` = **4**    | `u_train_buf_age_matrix`  | `perseus_ls_pf.sv:L3762`           | Prefetch training buffer oldest selection; class groups all tied to zero            | Deferred (named only)           |
-| `perseus_ls_prq`   | `` `PERSEUS_LS_PRQ_SIZE `` = **8**                | `u_prq_age_matrix`        | `perseus_ls_prq.sv:L409`           | Pending Request Queue oldest; single alloc source (`prq_alloc_a5`), groups tied 0    | Deferred (named only)           |
-| `perseus_ls_snoop` | `` `PERSEUS_LS_SNPQ_SIZE_TOTAL `` = **7** (4+3)   | `u_snpq_age_matrix`       | `perseus_ls_snoop.sv:L3858`        | Snoop Queue oldest; group_a = DVM class, group_b = cache-snoop class                | Deferred (named only)           |
+Per design spec §3 D5 (line 60), the shared primitive `ls_age_matrix`
+is "referenced by `ls_lrq` (and later `ls_sab`, `ls_rar`)". These are
+the spec's intended consumers:
 
-Macro resolution evidence:
+| Consumer   | `AM_SIZE` (spec intent) | Role (spec intent)                    | RTL instantiation status in this snapshot                                                                             |
+|------------|-------------------------|---------------------------------------|-----------------------------------------------------------------------------------------------------------------------|
+| `ls_lrq`   | 16                      | Ordering of outstanding loads         | Not instantiated — `grep -n 'perseus_ls_age_matrix\|age_matrix'` on `perseus_ls_lrq.sv` returns 0 hits.              |
+| `ls_sab`   | 24                      | Store address age tracking            | Not instantiated — `grep -n 'perseus_ls_age_matrix\|age_matrix'` on `perseus_ls_sab.sv` returns 0 hits.              |
+| `ls_rar`   | 40                      | Read-after-read ordering              | Not instantiated — `grep -n 'perseus_ls_age_matrix\|age_matrix'` on `perseus_ls_rar.sv` returns 0 hits.              |
+
+Evidence basis: design spec §3 D5 at line 60 (authoritative source); the
+`ls_lrq` / `ls_sab` / `ls_rar` modules exist in the RTL tree (referenced
+by row/line in the L1 scaffold) but their age-matrix hookup is not
+realized in this RTL snapshot. Under the pilot rule, this is interpreted
+as "RTL is a pruned subset of spec" rather than a spec error; no spec
+change is implied, and these rows remain valid architectural intent for
+later RTL revisions.
+
+### §7.2 Current RTL snapshot — observed instantiations (legitimate extensions beyond spec §3 D5 examples)
+
+The grep `grep -rn 'perseus_ls_age_matrix'
+perseus/logical/perseus_loadstore/verilog/` returns four live
+instantiations, listed below. Design spec §3 D5 names `ls_lrq` / `ls_sab`
+/ `ls_rar` as reference examples (the "e.g." list at spec §5.2 line 154
+and §7 R6 line 252 is explicitly illustrative), so the four consumers
+below are **spec-compatible extensions** rather than contradictions.
+
+| Consumer           | `AM_SIZE` (resolved)                              | Instance name             | Role (inferred from RTL wiring)                                                       | RTL location                           |
+|--------------------|---------------------------------------------------|---------------------------|---------------------------------------------------------------------------------------|----------------------------------------|
+| `perseus_ls_fb`    | `16` (integer literal at instance)                | `u_fb_age_matrix`         | Fill-Buffer oldest arbitration; per-L2-bank oldest (groups a–d = l2bank 0..3)         | `perseus_ls_fb.sv:L8526`               |
+| `perseus_ls_pf`    | `` `PERSEUS_LS_PF_TRAIN_BUFFER_SIZE `` = **4**    | `u_train_buf_age_matrix`  | Prefetch training buffer oldest selection; class groups all tied to zero              | `perseus_ls_pf.sv:L3762`               |
+| `perseus_ls_prq`   | `` `PERSEUS_LS_PRQ_SIZE `` = **8**                | `u_prq_age_matrix`        | Pending Request Queue oldest; single alloc source (`prq_alloc_a5`), groups tied 0     | `perseus_ls_prq.sv:L409`               |
+| `perseus_ls_snoop` | `` `PERSEUS_LS_SNPQ_SIZE_TOTAL `` = **7** (4+3)   | `u_snpq_age_matrix`       | Snoop Queue oldest; group_a = DVM class, group_b = cache-snoop class                  | `perseus_ls_snoop.sv:L3858`            |
+
+Macro resolution evidence (all in `perseus_ls_defines.sv`):
 - `` `PERSEUS_LS_PF_TRAIN_BUFFER_SIZE = 4 `` — `perseus_ls_defines.sv:L1041`.
 - `` `PERSEUS_LS_PRQ_SIZE = 8 `` — `perseus_ls_defines.sv:L1104`.
 - `` `PERSEUS_LS_SNPQ_SIZE_TOTAL = (4+3) = 7 `` — `perseus_ls_defines.sv:L874`.
 - `AM_SIZE=16` for `u_fb_age_matrix` is a literal integer at the instantiation site.
 
-### §7.2 Correction to Gate-3 consumer assumptions
-
-Sections §1 (Positioning table) and §3.3 (Instantiation sizes table) were
-authored under the design-spec §5.2 assumption that the three age-matrix
-consumers in the LSU are `ls_lrq` (16), `ls_sab` (24), and `ls_rar` (40).
-The ground-truth grep above **contradicts this**: none of `perseus_ls_lrq.sv`,
-`perseus_ls_sab.sv`, or `perseus_ls_rar.sv` instantiates
-`perseus_ls_age_matrix` at all (verified by `grep -n 'age_matrix\|age_mtx'`
-on those three files — zero hits). The actual consumers are `ls_fb`,
-`ls_pf`, `ls_prq`, and `ls_snoop`, with sizes 16 / 4 / 8 / 7.
-
-Per the pilot plan's "RTL wins over spec" rule, the Gate-3 UNVERIFIED flags
-on consumer sizes are **resolved here** and superseded by §7.1. The §1 and
-§3.3 tables remain as authored to preserve the Gate-3 audit trail; the
-reader should treat §7.1 as the authoritative catalog for any downstream
-work. The updated UNVERIFIED summary is collected in §8.3 below.
+Note: These four consumers are not enumerated in spec §3 D5's "e.g."
+list. Per the pilot rule, a RTL consumer outside the spec's illustrative
+examples is treated as a legitimate extension (additional instantiations
+are allowed so long as they don't conflict with spec-stated invariants).
+The §1 (Positioning) and §3.3 (Instantiation sizes) tables earlier in
+this document still list the spec-intent sizes (16/24/40) as authored
+during Gate 3 — they are preserved to reflect spec intent; readers
+cross-checking the current RTL snapshot should consult §7.2 above for
+the realized instantiations.
 
 ### §7.3 Per-instance wiring highlights
+
+The wiring-level detail below applies only to the §7.2 RTL-observed
+instantiations. The §7.1 spec-intent consumers (`ls_lrq` / `ls_sab` /
+`ls_rar`) have no wiring to document in this snapshot because the
+age-matrix instance is not yet present in their RTL.
 
 **`u_fb_age_matrix` (AM_SIZE=16, `perseus_ls_fb.sv:L8526`).** Three live
 alloc sources (`ls0/1/2_alloc_fb_entry_d3`), source 3 tied to zero;
@@ -831,7 +857,10 @@ lists, not to this document:
 
 | Location                        | Claim                                                                                                                              | Gate-5 status                                                                                                                                      |
 |---------------------------------|------------------------------------------------------------------------------------------------------------------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------|
-| §1 / §3.3 (Gate 3)              | Consumers are `ls_lrq`=16, `ls_sab`=24, `ls_rar`=40 (from design spec §5.2).                                                       | **Resolved — contradicted by RTL.** Actual consumers are `ls_fb`=16, `ls_pf`=4, `ls_prq`=8, `ls_snoop`=7 (see §7.1). `ls_lrq`/`ls_sab`/`ls_rar` do not instantiate this primitive. |
+| §1 / §3.3 (Gate 3, `ls_lrq`=16) | Spec §3 D5 names `ls_lrq` as a 16-entry age-matrix consumer.                                                                       | **Open — informational.** Spec intent; not realized in current RTL snapshot (`perseus_ls_lrq.sv` does not instantiate the primitive — see §7.1). No spec change implied; retained as architectural intent. |
+| §1 / §3.3 (Gate 3, `ls_sab`=24) | Spec §3 D5 names `ls_sab` as a 24-entry age-matrix consumer.                                                                       | **Open — informational.** Spec intent; not realized in current RTL snapshot (`perseus_ls_sab.sv` does not instantiate the primitive — see §7.1). No spec change implied; retained as architectural intent. |
+| §1 / §3.3 (Gate 3, `ls_rar`=40) | Spec §3 D5 names `ls_rar` as a 40-entry age-matrix consumer.                                                                       | **Open — informational.** Spec intent; not realized in current RTL snapshot (`perseus_ls_rar.sv` does not instantiate the primitive — see §7.1). No spec change implied; retained as architectural intent. |
+| §7.2 (Gate 5)                   | `ls_fb` (16), `ls_pf` (4), `ls_prq` (8), `ls_snoop` (7) instantiate the primitive but are not named in spec §3 D5's "e.g." list.    | **Documented — no action needed.** Per the pilot rule, RTL consumers outside spec's illustrative examples are legitimate extensions; not a conflict. Sizes resolved from `perseus_ls_defines.sv` (see §7.2). |
 | §4.2 (Gate 4)                   | Convention that `src_k_older[k]` self-bit is unread.                                                                               | Open — not re-verified in this gate; still informational. Pilot-scope OK.                                                                          |
 | §5.3 (Gate 4)                   | `PERSEUS_DFF_DELAY` / `PERSEUS_XPROP_FLOP` definitions in header.                                                                  | Open — conventions stated; header file not re-inspected.                                                                                           |
 | §6.1 item 6 (Gate 4)            | `AM_SIZE=1` degenerate size support is untested (no explicit assertion in RTL).                                                    | Open — in-tree min size is 4 (PF train buf), so `AM_SIZE=1` is operationally unreachable; flag retained for primitive-reuse guidance.              |
