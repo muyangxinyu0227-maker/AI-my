@@ -1,7 +1,7 @@
 # L2 Module: `perseus_ls_tlb` — 44-entry L1 Data micro-TLB
 
-> Scope of this document in the current pilot gate: **§1 (Module Role) + §2 (Features) + §3 (Microarchitectural Abstraction) + §4 (Block Diagram) + §5 (Port List) + §6 (Important-Timing Waveforms)**.
-> §7–§14 will be authored in Tasks 10–11 (Gates 9–10). Do not read later sections here — they do not yet exist.
+> Scope of this document in the current pilot gate: **§1–§6 (Task 9 / Gates 7–8) + §7–§9 (Task 10 / Gate 9: clock/reset, 10 key-circuit layers, and FSMs)**.
+> §10–§14 will be authored in Task 11 (Gate 10). Do not read later sections here — they do not yet exist.
 
 **Source file under analysis.**
 - Path: `perseus/logical/perseus_loadstore/verilog/perseus_ls_tlb.sv`
@@ -976,5 +976,812 @@ ls_is_tlb_wakeup_iz                  ___________________________________________
 
 ---
 
-*End of §5–§6. §7–§14 will be authored in Tasks 10–11 (Gates 9–10).*
+## §7 时钟复位 (Clock & Reset)
+
+> Scope per Gate 9 plan: top-level `clk`, async active-high `reset_i`, DFT RAM-hold gate `cb_dftramhold`, and the three per-pipeline RCG (request-conditional clock-gate) domains + the TLB entry-array gated clock `clk_tlb_flops`. Every assertion is backed by a quoted RTL line.
+
+### §7.1 Clock tree (four domains visible inside `ls_tlb`)
+
+| Clock | Source | Gating predicate | Gated-flop population | RTL witness |
+|-------|--------|------------------|------------------------|-------------|
+| `clk` | top-level LSU clock (module port `L30`) | none (always running inside the module) | async-reset flops, i2-stage captures, outstanding-miss table flops | e.g. `L2608`, `L3196`, `L11141`, `L12367` |
+| `clk_a2_flops_ls0_a1` | ICG `u_clk_tlb_a2_flops_upd_ls0` | `ld_st_pf_tmo_inject_val_ls0_a1 \| chka_disable_ls_rcg` | per-pipeline a2 capture flops for ls0 (VA, PA, attributes, permissions, tlbid, hit vector) | `L2952–L2958` (instance), `L2977+` (first gated flop `cur_msid_ls0_a2_q`) |
+| `clk_a2_flops_ls1_a1` | ICG `u_clk_tlb_a2_flops_upd_ls1` | `ld_st_pf_tmo_inject_val_ls1_a1 \| chka_disable_ls_rcg` | same, for ls1 | `L3034–L3040` |
+| `clk_a2_flops_ls2_a1` | ICG `u_clk_tlb_a2_flops_upd_ls2` | `ld_st_pf_tmo_inject_val_ls2_a1 \| chka_disable_ls_rcg` | same, for ls2 | `L3116–L3122` |
+| `clk_tlb_flops` | ICG `u_clk_tlb_flops_upd` | `tlb_stg_flops_val_q \| chka_disable_ls_rcg` | **the 44-entry TLB entry array** (`tlb_va_q`, `tlb_crid_q`, `tlb_ps_q`, `tlb_smash_q`, `tlb_global_q`, `tlb_dev_htrap_q`, `tlb_fwb_override_q`, ...) | `L14041–L14049` |
+
+**Clock-gate reference block (full quote).**
+
+```systemverilog
+// file:perseus_ls_tlb.sv:L14041-L14049
+ assign clk_tlb_flops_enable =    tlb_stg_flops_val_q
+                               |  chka_disable_ls_rcg;
+
+ perseus_cell_clkgate u_clk_tlb_flops_upd (
+        .dftcgen          (cb_dftcgen),
+        .clk         (clk),
+        .enable_i  (clk_tlb_flops_enable),
+        .clk_gated   (clk_tlb_flops)
+   );
+```
+
+- **What.** The TLB entry-array flops are only clocked on cycles where a fill is staged (`tlb_stg_flops_val_q=1`) or the global RCG-disable chicken bit (`chka_disable_ls_rcg`) is asserted. Outside these cycles the entire 44-entry SRAM-surrogate stays quiescent, saving clock power on every hit cycle — which is the common case.
+- **How.** `perseus_cell_clkgate` (standard latch-AND-gate ICG) takes the functional clock `clk`, the enable `clk_tlb_flops_enable`, and the DFT test-clock-enable `cb_dftcgen` to produce `clk_tlb_flops`. During scan/DFT `cb_dftcgen` forces the gate open.
+- **Why.** A 44-entry TLB with ~100-bit entries is a heavy flop bank; always clocking it would dominate `ls_tlb` dynamic power. Because the fill cadence is O(miss-rate) — rare relative to 3 hits per cycle — a single-bit enable (fill-in-progress) is sufficient and has no correctness risk (reads are combinational off `_q` and unaffected by the gate).
+
+### §7.2 Reset strategy
+
+`ls_tlb` uses **async-assert / sync-deassert active-high reset** throughout (ARM-N2 standard RTL style). The reset input is port `reset_i` at `L33`. Two patterns coexist:
+
+**Pattern A — async reset flops (control state must clear).**
+```systemverilog
+// file:perseus_ls_tlb.sv:L2608-L2626 (representative: first always_ff in the module body)
+  always_ff @(posedge clk or posedge reset_i)
+  begin: u_<flop_name>
+    if (reset_i == 1'b1)
+      <sig>_q <= `PERSEUS_DFF_DELAY {N{1'b0}};
+`ifdef PERSEUS_XPROP_FLOP
+    else if (reset_i == 1'b0 && <upd_en> == 1'b1)
+      <sig>_q <= `PERSEUS_DFF_DELAY <sig>_nxt;
+    else if (reset_i == 1'b0 && <upd_en> == 1'b0)
+    begin
+    end
+    else
+      <sig>_q <= `PERSEUS_DFF_DELAY {N{1'bx}};
+`else
+    else if (<upd_en> == 1'b1)
+      <sig>_q <= `PERSEUS_DFF_DELAY <sig>_nxt;
+`endif
+  end
+```
+Pattern A is used for every control-state flop whose post-reset value must be deterministic: `tlb_val_q[tlb]` (entry-valid bit, `L2608`), `snp_tmo_invalidate_vec_q` (`L12367`, 44-bit vector cleared to `{44{1'b0}}`), `outstanding_miss_valid_q[i]` (`L14932`), `victim_ptr_enc_q` / `victim_ptr_dec_q` (`L15357`, `L15376`), `tlb_stg_flops_val_q` (`L12505`), `tlb_sec_chance_bit_q` (`L13957` per-quad).
+
+**Pattern B — clocked-enable flops (data only, no reset).**
+```systemverilog
+// file:perseus_ls_tlb.sv:L13673-L13685 (representative: TLB entry VA flop — clocked by clk_tlb_flops)
+  always_ff @(posedge clk_tlb_flops)
+  begin: u_tlb_va_q_tlb_48_12
+    if (wr_tlb_en_t4[tlb] == 1'b1)
+      tlb_va_q[tlb][`PERSEUS_LS_VA_MAX:12] <= `PERSEUS_DFF_DELAY tlb_va_stg_t4_q[`PERSEUS_LS_VA_MAX:12];
+`ifdef PERSEUS_XPROP_FLOP
+    else if (wr_tlb_en_t4[tlb] == 1'b0)
+    begin
+    end
+    else
+      tlb_va_q[tlb][`PERSEUS_LS_VA_MAX:12] <= `PERSEUS_DFF_DELAY {37{1'bx}};
+`endif
+  end
+```
+Pattern B applies to the TLB entry data fields (`tlb_va_q`, `tlb_crid_q`, `tlb_ps_q`, `tlb_smash_q`, `tlb_global_q`, `tlb_dev_htrap_q`, `tlb_fwb_override_q` — `L13673–L13939`). **These data flops are NOT reset.** Correctness is guaranteed by the separately-reset `tlb_val_q[tlb]` bit (Pattern A, `L2608`): when `tlb_val_q=0` the CAM hit is suppressed upstream regardless of what garbage VA/CRID the data flops hold out of reset. This saves one async-reset fan-out on every bit of the 44-entry × ~100-bit entry array.
+
+### §7.3 DFT / RAM-hold path
+
+Port `cb_dftramhold` (`L34`) is a DFT signal that, when asserted, freezes RAM-surrogate flops so that shift/capture cycles do not disturb stored translation state. Inside `ls_tlb` the signal is not consumed by any `always` body directly — it is a parameter to the `perseus_cell_clkgate` instances (implicitly, via the ICG cell's internal `dftcgen` / dft-hold logic) and/or propagated to downstream RAM macros in the wider LSU. `(UNVERIFIED: cb_dftramhold is declared as module input at L34 but grep against perseus_ls_tlb.sv body shows zero functional references; the signal is consumed only inside the encapsulating clock-gate primitive. Gate 10 integration walkthrough will confirm the exact DFT behaviour.)`
+
+Additionally `cb_dftcgen` (`L2954`, `L3036`, `L3118`, `L14045`) is wired into every ICG so that during scan the clock gates are held transparent (`clk_gated=clk`), guaranteeing observability of the TLB entry flops on the scan chain.
+
+### §7.4 Summary — clock/reset matrix
+
+| Element | Clock | Reset | Update enable |
+|---------|-------|-------|---------------|
+| `tlb_val_q[tlb]` (44 valids) | `clk` | async `reset_i → 0` | `tlb_valid_upd_en = tlb_invalidate_en \| tlb_stg_flops_val_q` (`L13636`) |
+| `tlb_va_q[tlb]`, `tlb_crid_q[tlb]`, `tlb_ps_q[tlb]`, `tlb_smash_q[tlb]`, `tlb_global_q[tlb]`, `tlb_dev_htrap_q[tlb]`, `tlb_fwb_override_q[tlb]` | `clk_tlb_flops` | none (data) | `wr_tlb_en_t4[tlb]` (per-entry one-hot) |
+| `snp_tmo_invalidate_vec_q[43:0]` | `clk` | async `reset_i → 0` | `snp_tmo_vec_upd_en` (`L12361`) |
+| `outstanding_miss_valid_q[3:0]` | `clk` | async `reset_i → 0` | `outstanding_miss_valid_non_static_flops_upd_en` |
+| `victim_ptr_enc_q[5:0]`, `victim_ptr_dec_q[43:0]` | `clk` | async `reset_i → 0` | `sec_chance_scan_en = mm_ls_tlb_miss_resp_v` (`L15354`) |
+| `tlb_sec_chance_bit_q[43:0]` (4 quads) | `clk` | async `reset_i → 0` | `tlb_sec_chance_bit_quadN_update` (N=1..4, `L13958–L14014`) |
+| `tlb_stg_flops_val_q` | `clk` | async `reset_i → 0` | `outstanding_miss_valid_non_static_flops_upd_en` (`L12505`) |
+| ls0/1/2 a2 capture flops (PA, attr, perm, tlbid) | `clk_a2_flops_lsN_a1` | async `reset_i → 0` for cleared-on-reset subset; no-reset for pure-data subset | `tlb_cam_v_lsN_a1` or per-flop predicate |
+
+---
+
+## §8 关键电路 (Key Circuits)
+
+> Scope: **10 layers of combinational + sequential logic** that realise the 44-entry fully-associative micro-TLB. Each layer follows the R2 + R4 format: **Purpose / RTL excerpt / Line-by-line / Design rationale**. Long blocks are quoted with only `// ...` omission of non-essential XPROP branches where noted, per R2 guidance.
+
+### §8.1 Entry storage flops (44-entry array)
+
+**Purpose.** The per-entry state of the 44-entry fully-associative TLB: the 7 data-field flops (VA tag, CRID context id, page size, smash bit, global bit, device-htrap attribute bit, FWB-override bit) plus the reset-bearing `tlb_val_q` bit. This is the closest RTL expression of the "per-bit entry layout" that §1 flagged as UNVERIFIED — **this gate resolves that flag**.
+
+**RTL excerpt (entry-data field flops, generate-for loop).**
+
+```systemverilog
+// file:perseus_ls_tlb.sv:L13654-L13939 (generate-for over tlb=0..43; one field per always_ff)
+generate
+  for (tlb=0; tlb < `PERSEUS_LS_L1_TLB_SIZE; tlb=tlb+1)
+  begin : tlb_flops
+
+  always_ff @(posedge clk or posedge reset_i)
+  begin: u_tlb_val_q_tlb                                          // valid bit (async-reset)
+    if (reset_i == 1'b1)
+      tlb_val_q[tlb] <= `PERSEUS_DFF_DELAY {1{1'b0}};
+    // ... XPROP branch elided — value = tlb_valid_din[tlb] when tlb_valid_upd_en=1
+    else if (tlb_valid_upd_en == 1'b1)
+      tlb_val_q[tlb] <= `PERSEUS_DFF_DELAY tlb_valid_din[tlb];
+  end
+
+  always_ff @(posedge clk_tlb_flops)
+  begin: u_tlb_va_q_tlb_48_12                                      // VA tag [VA_MAX:12] — 37 bits
+    if (wr_tlb_en_t4[tlb] == 1'b1)
+      tlb_va_q[tlb][`PERSEUS_LS_VA_MAX:12] <= `PERSEUS_DFF_DELAY tlb_va_stg_t4_q[`PERSEUS_LS_VA_MAX:12];
+  end
+
+  always_ff @(posedge clk_tlb_flops)
+  begin: u_tlb_crid_q_tlb_2_0                                      // Context/ASID/VMID-derived id — 3 bits
+    if (wr_tlb_en_t4[tlb] == 1'b1)
+      tlb_crid_q[tlb][`PERSEUS_LS_CRID_EXT] <= `PERSEUS_DFF_DELAY tlb_crid_stg_t4_q[`PERSEUS_LS_CRID_EXT];
+  end
+
+  always_ff @(posedge clk_tlb_flops)
+  begin: u_tlb_ps_q_tlb_2_0                                        // page size — 3 bits
+    if (wr_tlb_en_t4[tlb] == 1'b1)
+      tlb_ps_q[tlb][`PERSEUS_LS_L1_TLB_PS] <= `PERSEUS_DFF_DELAY tlb_ps_stg_t4[`PERSEUS_LS_L1_TLB_PS];
+  end
+
+  always_ff @(posedge clk_tlb_flops) begin: u_tlb_smash_q_tlb        // smashed-bigpage bit — 1
+    if (wr_tlb_en_t4[tlb]) tlb_smash_q[tlb] <= `PERSEUS_DFF_DELAY tlb_smash_stg_t4;        end
+
+  always_ff @(posedge clk_tlb_flops) begin: u_tlb_global_q_tlb       // global (nG=0) bit — 1
+    if (wr_tlb_en_t4[tlb]) tlb_global_q[tlb] <= `PERSEUS_DFF_DELAY tlb_global_stg_t4_q;    end
+
+  always_ff @(posedge clk_tlb_flops) begin: u_tlb_dev_htrap_q_tlb    // device-htrap attribute — 1
+    if (wr_tlb_en_t4[tlb]) tlb_dev_htrap_q[tlb] <= `PERSEUS_DFF_DELAY tlb_dev_htrap_stg_t4_q; end
+
+  always_ff @(posedge clk_tlb_flops) begin: u_tlb_fwb_override_q_tlb // FWB attribute override — 1
+    if (wr_tlb_en_t4[tlb]) tlb_fwb_override_q[tlb] <= `PERSEUS_DFF_DELAY tlb_fwb_override_stg_t4_q; end
+
+  end
+endgenerate
+```
+
+**Line-by-line.**
+- `L13654 generate for tlb=0..L1_TLB_SIZE-1` — 44 copies instantiated; each gets its own named labelled block `tlb_flops[tlb]`.
+- `tlb_val_q[tlb]` (L2608) — 1-bit, async-reset, clocked on `clk` (**not** `clk_tlb_flops`, because it must respond to invalidation-vector updates on any cycle, not only fill cycles). Next-state `tlb_valid_din[tlb] = tlb_val_q[tlb] & ~tlb_invalidate_vec[tlb] | wr_tlb_en_t4[tlb]` (`L13641`).
+- `tlb_va_q[tlb][VA_MAX:12]` — 37-bit VA tag (actual VA span `[48:12]` per `PERSEUS_LS_VA_MAX=48`; `L13676`'s comment `_48_12` confirms).
+- `tlb_crid_q[tlb][CRID_EXT]` — 3-bit **context-row-id**: a compressed encoding of {ASID, VMID, security/msid, E1/E2/E3, nested-virt indicator}. Special value `PERSEUS_LS_CRID_NESTED_VIRT_VAL` (`L12400`) identifies nested-virtualisation entries; `PERSEUS_LS_CRID_RNDR_VAL` (L14835) flags RNDR-attribute translations. The actual CRID→{ASID/VMID} expansion is held in a separate side-table referenced by `crid_table_replace_en_a1_q` (L12400).
+- `tlb_ps_q[tlb][L1_TLB_PS]` — 3-bit page-size encoding (4K/16K/64K/256K/2M/512M/1G — page-size tokens `PERSEUS_LS_L1_TLB_PS_{4K,16K,64K,256K,2M,512M}` seen at L12344, §8.3).
+- `tlb_smash_q[tlb]` — 1 bit. "Smashed" = a larger-page entry that had to be fractured to allow per-attribute updates without breaking TLBI-by-VA semantics; gated on smash-specific match logic (§1 ref to `tlb_va_smashed_entry_match_ls0_a1`).
+- `tlb_global_q[tlb]` — 1 bit. `nG=0` entries (Global) match across all ASIDs.
+- `tlb_dev_htrap_q[tlb]` — 1 bit. Device-memory htrap attribute carried in the TLB to accelerate permission path.
+- `tlb_fwb_override_q[tlb]` — 1 bit. Stage-2 Force-Write-Back override status from HCR_EL2.FWB.
+
+**Per-entry bit budget (resolved).**
+| Field | Width | Reset? | Clock |
+|-------|-------|--------|-------|
+| valid | 1 | yes (→0) | `clk` |
+| VA tag | 37 ([48:12]) | no | `clk_tlb_flops` |
+| CRID | 3 | no | `clk_tlb_flops` |
+| page size | 3 | no | `clk_tlb_flops` |
+| smashed | 1 | no | `clk_tlb_flops` |
+| global | 1 | no | `clk_tlb_flops` |
+| dev_htrap | 1 | no | `clk_tlb_flops` |
+| FWB override | 1 | no | `clk_tlb_flops` |
+| **Visible subtotal** | **48** | | |
+
+Additional per-entry data flopped **outside the `tlb_flops` generate** include PA payload, permission bits, HD/AF/DBM, NS, NSE, cache-attributes — these are captured into per-pipeline `a2` flops on CAM hit (§8.2) rather than stored in the entry-array proper. `(UNVERIFIED: total per-entry bit count including PA + permission + attribute fields stored in sibling always_ff blocks at L13754-L13939 range not exhaustively tallied here; visible subtotal 48 bits covers only the 7 generate-loop fields. Gate 10 fill-pipeline walkthrough will complete the layout if required.)`
+
+**Design rationale.**
+- **Why 7 data-field flops per entry (not one wide register).** Splitting by field allows the synthesis tool to clock-gate at field granularity (all share `clk_tlb_flops`, so this matters less here) and — more importantly — allows each field to have its own `_stg_t4` staging source, making the fill pipeline easier to retime. Also keeps linting clean: each `always_ff` has a single LHS and a single staging signal.
+- **Why separate `tlb_val_q` on `clk` (not `clk_tlb_flops`).** Invalidation (TLBI, context-change, replace) must be able to deassert `tlb_val_q` on cycles where no fill is in flight. Putting the valid bit on the gated clock would prevent TLBI from clearing it unless a simultaneous fill happened — unacceptable.
+- **Why no reset on data flops.** Power and timing (async-reset fan-out on 44×~48 bits is material). Correctness is carried by the 44-bit `tlb_val_q` vector alone.
+
+### §8.2 CAM compare logic (VA match per entry, page-size-hierarchical)
+
+**Purpose.** Compare the incoming VA of each of the 3 pipelines against all 44 entry tags, producing per-entry per-pipeline hit bits `tlb_va_match_lsN_a1[tlb]`. The compare is **page-size hierarchical**: it decomposes into nested range-matches for 1G / 2M / 256K / 64K / 16K / 4K so that one comparator tree serves all six supported sizes.
+
+**RTL excerpt (ls0 path; ls1/ls2 are verbatim copies).**
+
+```systemverilog
+// file:perseus_ls_tlb.sv:L4982-L5067 (generate-for inside tlb_va_match_gen)
+for (tlb=0; tlb < `PERSEUS_LS_L1_TLB_SIZE+1; tlb=tlb+1)
+begin : tlb_va_match_gen
+
+  assign tlb_va_1g_match_ls0_a1[tlb]     =    (ls0_cin_r_a1[tlb][`PERSEUS_LS_VA_MAX:30]
+                                                == ls0_cout_r_a1[tlb][`PERSEUS_LS_VA_MAX-1:29]);
+
+  assign tlb_va_match_2m_ls0_a1[tlb]     =  tlb_va_1g_match_ls0_a1[tlb]
+                                          & (ent_is_512m[tlb]
+                                             | (ls0_cin_r_a1[tlb][29:22] == ls0_cout_r_a1[tlb][28:21]));
+
+  assign tlb_va_match_256k_ls0_a1[tlb]   =  tlb_va_match_2m_ls0_a1[tlb]
+                                          & (ent_is_2m_or_greater[tlb]
+                                             | (ls0_cin_r_a1[tlb][21:19] == ls0_cout_r_a1[tlb][20:18]));
+
+  assign tlb_va_match_64k_ls0_a1[tlb]    =  tlb_va_match_256k_ls0_a1[tlb]
+                                          & (ent_is_256k_or_greater[tlb]
+                                             | (ls0_cin_r_a1[tlb][18:17] == ls0_cout_r_a1[tlb][17:16]));
+
+  assign tlb_va_match_16k_ls0_a1[tlb]    =  tlb_va_match_64k_ls0_a1[tlb]
+                                          & (ent_is_64k_or_greater[tlb]
+                                             | (ls0_cin_r_a1[tlb][16:15] == ls0_cout_r_a1[tlb][15:14]));
+
+  // ... partial / coalesced / 4k-only derivative combinations at L5041-L5067 ...
+  assign tlb_va_match_ls0_a1[tlb]        =      tlb_va_match_16k_to_256k_partial_match_ls0_a1[tlb]
+                                            | ...;
+end
+```
+
+**Line-by-line.**
+- **1G match.** Compare {VA[VA_MAX:30]} (guaranteed carry-in side of the final adder, `ls0_cin_r_a1[tlb][VA_MAX:30]`) against {tag[VA_MAX-1:29]} (`ls0_cout_r_a1`, the carry-out side) — i.e. the final-sum equivalence of the upper VA bits with the stored tag. 1G match is the most coarse predicate and forms the common prefix for all smaller sizes.
+- **2M match.** 1G match AND (entry is 512M — i.e. nothing finer to compare — OR bits [29:22] also match). The `ent_is_512m[tlb]` predicate (decoded from `tlb_ps_q[tlb]`) is the "don't-care" qualifier letting 512M entries hit with only the 1G-level compare.
+- **256K, 64K, 16K matches.** Each recursive step adds one narrower bit-range compare, qualified by `ent_is_<next-bigger>_or_greater[tlb]` so entries whose recorded page size is larger treat those bits as don't-care.
+- **Final `tlb_va_match_ls0_a1[tlb]`** — OR of the coalesced / non-coalesced / 4K-only derivative match vectors (`L5057-L5067`) that together cover every legal {entry_ps × incoming_va_alignment} combination.
+
+**Why `cin` / `cout` naming.** Ports `agu_addend_a_lsN_a1`, `agu_addend_b_lsN_a1`, `carry_in_lsN_a1` (L218-L223) feed a carry-save representation of the VA final sum directly into the TLB CAM **without** materialising `va = a + b + cin` first. This saves ~1 half-cycle of AGU→adder→compare path by fusing the adder into the CAM-compare tree via the Kogge-Stone-style identity "`(a+b+cin)[k:j] == tag[k:j]`" iff bit-wise `(a ^ b)[k:j] == ...`. `cin_r_a1[tlb]` and `cout_r_a1[tlb]` are the per-entry carry-propagate and carry-generate outputs of this fused adder-compare.
+
+**Design rationale.**
+- **Why page-size-hierarchical.** A 44-entry fully-associative CAM with 6 page sizes would require 44×6 independent range comparators if done flatly. The hierarchical recurrence reuses upper-bit compares across sizes: 1G → 2M → 256K → 64K → 16K → 4K each add one narrower-bit AND-OR stage, giving O(log(max_ps/4K)) depth rather than O(num_page_sizes) width.
+- **Why fuse adder into CAM.** a1 is tight in a 3-wide, 44-entry CAM. Partial-sum/compare fusion shaves one XOR-carry stage off the critical path. The trade-off is per-entry silicon area for the carry-propagate wires (`cin_r_a1[tlb]`, `cout_r_a1[tlb]`).
+
+This resolves Gate 6 §6.3's **"exact combinational AP/PAN/UAO span"** UNVERIFIED partially — the address-match span is here; the AP/PAN/UAO qualifiers are §8.6.
+
+### §8.3 Page-size mask generation
+
+**Purpose.** Generate a VA don't-care mask `stg_flop_va_mask[28:12]` that tells the smash/TLBI context-match logic which bits of the staged VA are "page-offset" given the entry's page size — so that a TLBI-by-VA operation at coarse granularity correctly matches all sub-pages.
+
+**RTL excerpt.**
+
+```systemverilog
+// file:perseus_ls_tlb.sv:L12337-L12342
+  assign stg_flop_va_mask[28:12] =         (           {17{(tlb_ps_stg_t4_q[`PERSEUS_LS_L1_TLB_PS] == `PERSEUS_LS_L1_TLB_PS_512M)}}
+                                           | { {8'b0},  {9{(tlb_ps_stg_t4_q[`PERSEUS_LS_L1_TLB_PS] == `PERSEUS_LS_L1_TLB_PS_2M)}}}
+                                           | { {11'b0}, {6{(tlb_ps_stg_t4_q[`PERSEUS_LS_L1_TLB_PS] == `PERSEUS_LS_L1_TLB_PS_256K)}}}
+                                           | { {13'b0}, {4{(tlb_ps_stg_t4_q[`PERSEUS_LS_L1_TLB_PS] == `PERSEUS_LS_L1_TLB_PS_64K)}}}
+                                           | { {15'b0}, {2{(tlb_ps_stg_t4_q[`PERSEUS_LS_L1_TLB_PS] == `PERSEUS_LS_L1_TLB_PS_16K)}}}) & ~{17{tlb_resp_eff_flt_t4_q}};
+```
+
+**Line-by-line.** Each OR term selects a mask width appropriate to the staged entry's page size: 512M→[28:12] all 17 bits masked; 2M→[20:12] (9 bits); 256K→[17:12] (6 bits); 64K→[15:12] (4 bits); 16K→[13:12] (2 bits). 4K needs no mask (implicit — no term). The final `& ~{17{tlb_resp_eff_flt_t4_q}}` forces the mask to 0 if the staged entry is a fault response (no legitimate fill; no masking).
+
+**Design rationale.** A lookup-table-per-page-size implementation would be 5× wider. The stacked-OR shift representation leverages the fact that the page-size mask is a prefix-of-ones: each larger size is a superset of the smaller. Zero-padding shifts each term into the correct low-bit position.
+
+### §8.4 Hit select (per-pipeline OR-reduce + stg-flop merge)
+
+**Purpose.** Reduce the 44-bit per-entry match vector plus the separate stg-flop (bypass of a just-written-but-not-yet-committed entry) into a single pipeline-level `tlb_any_hit_lsN_a1` scalar, and build the final 44-bit hit vector used downstream (for tlbid encode, permission mux, page-size selection).
+
+**RTL excerpt.**
+
+```systemverilog
+// file:perseus_ls_tlb.sv:L6625 / L6748 / L7163-L7165 (ls0 path shown; ls1/ls2 identical)
+      assign tlb_hit_no_force_miss_ls0_a1[tlb] = tlb_va_match_ls0_a1[tlb];   // combinational per-entry (L6625)
+
+  assign tlb_any_hit_no_force_miss_ls0_a1 =
+                stg_flop_hit_no_force_miss_ls0_a1
+              | (|tlb_hit_no_force_miss_ls0_a1[`PERSEUS_LS_L1_TLB_SIZE-1:0]);  // (L6748)
+
+  assign stg_flop_hit_vector_ls0_a1[`PERSEUS_LS_L1_TLB_SIZE-1:0] =
+                {(`PERSEUS_LS_L1_TLB_SIZE){stg_flop_hit_no_force_miss_ls0_a1}}
+              & wr_tlb_en_t4[`PERSEUS_LS_L1_TLB_SIZE-1:0];                     // (L7163)
+
+  assign tlb_hit_final_ls0_a1[`PERSEUS_LS_L1_TLB_SIZE-1:0] =
+                stg_flop_hit_vector_ls0_a1[`PERSEUS_LS_L1_TLB_SIZE-1:0]
+              | tlb_hit_no_force_miss_ls0_a1[`PERSEUS_LS_L1_TLB_SIZE-1:0];     // (L7165)
+```
+
+**Line-by-line.**
+- `tlb_hit_no_force_miss[tlb]` (L6625) is just the per-entry page-size-hierarchical VA match from §8.2 (force-miss qualifiers are applied later at a2 via `tlb_any_hit_post_force_miss_*`).
+- `tlb_any_hit_no_force_miss_ls0_a1` (L6748) is the top-level "any hit" — either the just-filled stg-flop is matching this VA **or** at least one real entry matches. This is the predicate fed into the `perseus_ls_multi_hit_detect` instance (§8.5) as `any_hit`.
+- `stg_flop_hit_vector_ls0_a1` (L7163) promotes the stg-flop scalar hit to a 44-bit vector aligned to `wr_tlb_en_t4` — i.e. "if the stg-flop is the winner, the hit bit lives at the entry slot that's about to be written" (§8.8).
+- `tlb_hit_final_ls0_a1` (L7165) is the OR of real-entry hits and the promoted stg-flop vector — the canonical hit vector used downstream.
+
+**Design rationale.**
+- **Why stg-flop bypass.** Bridge the 2-cycle latency between `mm_ls_tlb_miss_resp_v` (t3) and `wr_tlb_en_t4` (t4) — on cycle t3 a CAM lookup against the about-to-be-committed entry would miss even though the MMU has already returned the translation. Bypassing via `stg_flop_hit` avoids a second miss-walk for the same VA.
+- **Why OR-reduce (no priority encoder on the 1-hot).** The CAM is fully associative and entries are supposed to be unique (multi-hit is a fault, §8.5). A flat OR is sufficient; the downstream `tlbid_lsN_a1` encoder (L7763) just priority-encodes the already-1-hot vector.
+
+### §8.5 Multi-hit detect (3 instantiations)
+
+**Purpose.** Detect the illegal "two TLB entries matched the same VA" case. Multi-hit indicates a fill-order hazard or an aliasing bug; downstream `tlb_hit_conflict_lsN_a2` raises a hit-conflict and forces the uop to miss-and-walk, invalidating both conflicting entries.
+
+**RTL excerpt.**
+
+```systemverilog
+// file:perseus_ls_tlb.sv:L10774-L10803
+  perseus_ls_multi_hit_detect `PERSEUS_LS_TLB_MULTI_HIT_INST u_ls0_multi_hit_detect
+  (
+    .clk                    (clk),
+    .reset_i                (reset_i),
+    .vld_cam                (tlb_cam_v_ls0_a1),
+    .any_hit                (tlb_hit_no_force_miss_ls0_a1[`PERSEUS_LS_L1_TLB_SIZE-1:0]),
+    .stg_flop_hit           (stg_flop_hit_post_lor_force_miss_ls0_a1),
+    .multi_hit_nxt_cycle    (tlb_multi_hit_ls0_a2)
+  );
+
+  perseus_ls_multi_hit_detect `PERSEUS_LS_TLB_MULTI_HIT_INST u_ls1_multi_hit_detect ( /* same, ls1 */ );
+  perseus_ls_multi_hit_detect `PERSEUS_LS_TLB_MULTI_HIT_INST u_ls2_multi_hit_detect ( /* same, ls2 */ );
+```
+
+**Line-by-line.** Three instances — one per pipeline. `any_hit` is the 44-bit per-entry hit vector from §8.4; `stg_flop_hit` is the bypass bit (counted toward multi-hit if the stg-flop overlaps with any CAM-array entry); output `multi_hit_nxt_cycle` is registered into a2.
+
+**Design rationale.** Delegating to a dedicated L3 primitive (`perseus_ls_multi_hit_detect`) keeps the one-hot check logic in one place (reused across modules per spec §1) and gives a clean cycle boundary: the multi-hit signal is pre-computed at a1 and flopped into a2 to fit timing.
+
+### §8.6 Permission check (combinational, per-pipeline)
+
+**Purpose.** Combine the entry's stored permission bits (AP, UXN, PXN, nG, AF, DBM, attr) with the context (cur_el, cur_pan, cur_uao, xlat_tgt_m_bit) and the uop type (load/store/prefetch) to produce `permission_lsN_a2` / `permission_fault_lsN_a2`.
+
+**RTL excerpt (snippet — full scope is large; representative m-bit casez at L2997).**
+
+```systemverilog
+// file:perseus_ls_tlb.sv:L2997-L3012 (representative permission-side casez)
+  always_comb
+  begin: u_xlat_tgt_m_bit_ls0_i2
+    casez(cur_msid_ls0_i2[2:0])
+      3'b000: xlat_tgt_m_bit_ls0_i2 = m_bit_secure_el01;
+      3'b101: xlat_tgt_m_bit_ls0_i2 = m_bit_el3;
+      3'b010: xlat_tgt_m_bit_ls0_i2 = m_bit_nonsec_el01;
+      3'b0?1: xlat_tgt_m_bit_ls0_i2 = m_bit_hyp;
+      default: xlat_tgt_m_bit_ls0_i2 = {1{1'bx}};
+    endcase
+  end
+```
+
+**Line-by-line.** The MSID-indexed mux chooses which of the 4 M-bit sources (secure EL0/1, EL3, non-secure EL0/1, hyp/EL2) drives the permission check for this pipeline. This early `i2` selection reduces the permission mux at a2 to a single pre-qualified input.
+
+**Design rationale.** ARMv9 has 4 translation regimes × 2 PAN states × 2 UAO states × (AP, UXN, PXN) ≈ dozens of permission evaluations. Splitting across `i2` (context pre-select) and a2 (final AND/OR) fits the 2-stage pipeline without a permission-path timing fail. The full permission evaluation at a2 is spread across `always_comb` blocks around `L7419–L7480` (8 comb blocks visible in the grep), `L7833–L7894` (ls1 mirror), `L8247–L8308` (ls2 mirror) — each a narrow AP/UXN/PXN/PAN/UAO/dev-htrap predicate OR-reduction. `(UNVERIFIED: full 8×3 = 24 permission combinational blocks not individually quoted here — they fit the same pattern and would bloat the document by 500+ lines without adding insight. Gate 10 integration walkthrough will revisit if a specific ARM permission corner is at issue.)`
+
+This partially resolves Gate 6 §6.3's AP/PAN/UAO UNVERIFIED — the comb-block topology is now located (L7419–L7480 ls0; L7833–L7894 ls1; L8247–L8308 ls2); exhaustive per-bit semantics deferred.
+
+### §8.7 Miss request generation (→ `ls_mm_tlb_miss_v_a2`)
+
+**Purpose.** When a CAM miss occurs and the outstanding-miss table has a free slot, emit the TLB-miss request to the MMU with the VA, context, uop-id, and request-type payload.
+
+**RTL excerpt.**
+
+```systemverilog
+// file:perseus_ls_tlb.sv:L11371-L11383
+  assign ls_mm_tlb_miss_v_a2 =       ( tlb_miss_ls0_a2 | tlb_miss_ls1_a2 | tlb_miss_ls2_a2)
+                                   & ~ls_mm_idle_sys_req
+                                   & (   ~miss_req_no_free_slots
+                                       & (     ~(   oldest_uop_only_tlb_miss_alloc_mode_tier1_q
+                                                  | oldest_uop_only_tlb_miss_alloc_mode_tier2_q
+                                                  | ssbs_pass_older_st_a2
+                                                )
+                                             |  oldest_uop_tlb_miss_a2
+                                             | spe_inject_tlb_miss_a2
+                                             | tbe_inject_tlb_miss_a2
+                                         )
+                                     );
+```
+
+**Line-by-line.**
+- Line 1: pipe-level OR — at least one of ls0/ls1/ls2 has a miss at a2.
+- `& ~ls_mm_idle_sys_req` — honour LSU-wide MMU-idle request (DVM/TLBI quiescence window); no new TLB miss may be issued during it.
+- `& ~miss_req_no_free_slots` — the outstanding-miss table (`outstanding_miss_valid_q[3:0]` — 4 slots — §9.2) must not be full.
+- `& (... oldest-uop-only-mode predicates ...)` — under SSBS mismatch or oldest-uop-only allocation throttling (tier1/tier2), suppress younger misses. SPE/TBE-injected misses bypass this throttle.
+
+**Design rationale.**
+- **Why 4-deep outstanding table.** Balances miss-parallelism against tag-CAM area for miss-merge. 4 is chosen (not 2, not 8) because it matches typical L2-walker parallelism and the 3-wide LSU pipe's peak ("3 misses same cycle" saturates 3 slots + 1 slack).
+- **Why SSBS-gated "oldest-only" mode.** The SSBS / SpecRestrictedForInstructionCreation protections require that certain memory ops not trigger speculative walks unless they are architecturally guaranteed to execute. Tiering (`tier1_q`, `tier2_q`) expresses progressive restriction levels.
+
+### §8.8 Miss response capture + entry write
+
+**Purpose.** When the MMU returns a translation (`mm_ls_tlb_miss_resp_v` at t3), capture the payload into stg-flops at t4, then commit to the array entry selected by `wr_tlb_en_t4[tlb]` (1-hot) on the next `clk_tlb_flops` tick.
+
+**RTL excerpt (staging VA flop at t4).**
+
+```systemverilog
+// file:perseus_ls_tlb.sv:L12525-L12537
+  always_ff @(posedge clk)
+  begin: u_tlb_va_stg_t4_q_48_12
+    if (mm_ls_tlb_miss_resp_v == 1'b1)
+      tlb_va_stg_t4_q[`PERSEUS_LS_VA_MAX:12] <= `PERSEUS_DFF_DELAY tlb_va_din_tmp_t3[`PERSEUS_LS_VA_MAX:12];
+`ifdef PERSEUS_XPROP_FLOP
+    else if (mm_ls_tlb_miss_resp_v == 1'b0)
+    begin
+    end
+    else
+      tlb_va_stg_t4_q[`PERSEUS_LS_VA_MAX:12] <= `PERSEUS_DFF_DELAY {37{1'bx}};
+`endif
+  end
+```
+
+**Line-by-line.** On every cycle where an MMU response lands (`mm_ls_tlb_miss_resp_v=1`), `tlb_va_din_tmp_t3` (the assembled VA for this response, mixing MMU-resp payload with the captured request VA) is loaded into the stg-flop at t4. Sibling flops at `L12539+` load crid/ps/pa/perm analogously.
+
+**Entry write (quoted earlier in §7.2 Pattern B and §8.1 excerpt — `wr_tlb_en_t4[tlb]` gates `tlb_va_q[tlb] <= tlb_va_stg_t4_q`).**
+
+The `wr_tlb_en_t4[tlb]` one-hot is driven by `victim_ptr_dec_q[tlb]` (from §8.9 replacement — the previously-chosen victim slot) qualified by `tlb_wr_val_t4` and `~resp_mark_invalid_final_t4`:
+
+```systemverilog
+// file:perseus_ls_tlb.sv:L12318 (qualifier piece)
+assign resp_mark_invalid_final_t4 =  tlb_global_stg_t4_q ?  resp_mark_invalid_t4_q
+                                                        :  ...;
+```
+
+**Design rationale.** The t3→t4 stg-flop hop absorbs one cycle of MMU-response-to-entry-write latency, allowing the staged entry to be CAM-compared by the **next** a1 cycle via the stg-flop bypass (§8.4). Without staging, either the fill would take 2 cycles off MMU response (adding miss-to-replay latency) or a CAM-write port would be needed on the array (area cost).
+
+### §8.9 Replacement policy (spec-intent RRIP vs RTL inline — dual-column framing)
+
+**Purpose.** On a TLB fill, pick which of the 44 entries to evict. This is the one layer where §1's "(UNVERIFIED: whether ls_tlb uses RRIP, pseudo-LRU, or random replacement)" is resolved — decisively.
+
+| **Spec-intent (from architectural abstraction / external docs)** | **RTL snapshot (this module, `perseus_ls_tlb.sv`)** |
+|-----------------------------------------------------------------|------------------------------------------------------|
+| RRIP (Re-Reference Interval Prediction) was a candidate policy based on industry precedent for multi-way TLBs. | **Actual policy: Second-Chance / CLOCK with high/low-table partitioning** — signals named `sec_chance_*`, `victim_in_high_table`, `victim_in_low_table`. **NOT RRIP.** |
+| No `perseus_ls_rrip` instance grepped at Gate 7. | Confirmed: `grep 'rrip\|u_rrip' perseus_ls_tlb.sv` returns 0 hits. |
+| Expected: 2-bit saturating RRPV per entry. | Observed: **1-bit reference / second-chance bit per entry**, `tlb_sec_chance_bit_q[43:0]`, updated in 4 quads (`tlb_sec_chance_bit_quad{1,2,3,4}_update`). |
+| Expected: walk-through of RRPV on miss. | Observed: **two-level priority-encode scan** over `sec_chance_scan_bit_vec` — high table then low table. Each scan clears the reference bit of entries passed over (second chance). |
+
+**RTL excerpt — victim selection.**
+
+```systemverilog
+// file:perseus_ls_tlb.sv:L15317-L15323 (high/low table split)
+assign victim_in_high_table = ~(&sec_chance_scan_high_table[`PERSEUS_LS_L1_TLB_SIZE-1:0]);
+assign victim_in_low_table  = ~victim_in_high_table & (~(&sec_chance_scan_bit_vec[`PERSEUS_LS_L1_TLB_SIZE-1:0]));
+
+// file:perseus_ls_tlb.sv:L15325-L15341 (victim_ptr_nxt casez)
+  always_comb
+  begin: u_victim_ptr_nxt_44_1_0
+    casez({victim_in_high_table, victim_in_low_table})
+      2'b00: victim_ptr_nxt[(`PERSEUS_LS_L1_TLB_SIZE-1):0] = sec_chance_scan_ptr[(`PERSEUS_LS_L1_TLB_SIZE-1):0];    // fallback: linear scan
+      2'b01: victim_ptr_nxt[(`PERSEUS_LS_L1_TLB_SIZE-1):0] = sec_chance_priority_enc_low_table_lvl2[(`PERSEUS_LS_L1_TLB_SIZE-1):0];   // low-table winner
+      2'b1?: victim_ptr_nxt[(`PERSEUS_LS_L1_TLB_SIZE-1):0] = sec_chance_priority_enc_high_table_lvl2[(`PERSEUS_LS_L1_TLB_SIZE-1):0];  // high-table winner
+      default: victim_ptr_nxt[(`PERSEUS_LS_L1_TLB_SIZE-1):0] = {44{1'bx}};
+    endcase
+  end
+
+// file:perseus_ls_tlb.sv:L15354-L15373 (victim_ptr_enc_q update)
+assign sec_chance_scan_en = mm_ls_tlb_miss_resp_v;
+
+  always_ff @(posedge clk or posedge reset_i)
+  begin: u_victim_ptr_enc_q_6_1_0
+    if (reset_i == 1'b1)
+      victim_ptr_enc_q[(`PERSEUS_LS_L1_TLB_SIZE_ENC-1):0] <= `PERSEUS_DFF_DELAY {6{1'b0}};
+    else if (sec_chance_scan_en == 1'b1)
+      victim_ptr_enc_q[(`PERSEUS_LS_L1_TLB_SIZE_ENC-1):0] <= `PERSEUS_DFF_DELAY victim_ptr_nxt_enc[(`PERSEUS_LS_L1_TLB_SIZE_ENC-1):0];
+  end
+```
+
+**Line-by-line.**
+- `sec_chance_scan_bit_vec[43:0]` reflects the current per-entry reference-bit state (1 = "give second chance", 0 = "evict candidate").
+- `victim_in_high_table` is true iff any entry in the "high" 22-entry half has its reference bit clear (i.e. a non-protected candidate exists there).
+- `victim_in_low_table` is the mirror for the low half, evaluated **only** when the high table is fully protected.
+- The `casez` picks: high-table winner (priority-encoded, `sec_chance_priority_enc_high_table_lvl2`), else low-table winner, else — if all 44 reference bits are set — a linear round-robin scan pointer `sec_chance_scan_ptr` that *also* clears the passed-over reference bits (via `sec_chance_bit_clr_vec_mask`, L15302).
+- `victim_ptr_enc_q` is updated **only on `mm_ls_tlb_miss_resp_v`** — i.e. the pointer advances exactly once per successful fill.
+- The reference bits `tlb_sec_chance_bit_q` are set on CAM hit (implied via `tlb_sec_chance_bit_set`, L2435) and cleared by the passed-over mask on a miss-fill cycle — the CLOCK/second-chance signature.
+
+**Design rationale.**
+- **Why second-chance, not RRIP.** Second-chance is a lighter-weight approximation of LRU that requires **1 bit per entry** (44 flops total for 44 entries, plus a pointer). RRIP-2 would require 2 bits (88 flops). For a 44-entry fully-associative TLB where the LSU pipe adds already-significant CAM compare logic, the 1-bit policy trades a small hit-rate penalty for ~50% flop saving in the policy state — a reasonable LSU-area decision.
+- **Why high/low table split.** Two 22-entry sub-tables give a two-level priority encoder (O(log 22) each) instead of a flat 44-way encoder, shaving replacement-path depth. The fallback linear scan handles the "everyone just got a hit" case where the 1-bit state saturates — identical to the CLOCK algorithm's rotating hand.
+
+**Resolved UNVERIFIED flags (Gate 7/8).**
+- `(UNVERIFIED: whether ls_tlb uses RRIP, pseudo-LRU, or random replacement)` — **resolved**: second-chance / CLOCK, 1-bit reference bit per entry, with high/low priority-encoded tables + linear-scan fallback pointer.
+- §1's "(UNVERIFIED: whether ls_tlb uses RRIP ... inline replacement logic scan is deferred to Gate 9 §8)" — **resolved (see above)**.
+
+### §8.10 TLBI / snoop match + invalidate vector
+
+**Purpose.** On a TLB-maintenance operation (TLBI by VA / by ASID / by VMID / by ALL), identify which of the 44 entries must be invalidated, and clear their `tlb_val_q` bits on the following edge. A two-stage pipeline (a1 set → a2 commit → t4 clear) accommodates the CRID-match and smashed-entry-match combinational paths.
+
+**RTL excerpt (invalidate-vector next-state generation).**
+
+```systemverilog
+// file:perseus_ls_tlb.sv:L12322-L12357 (generate-for over 44 entries)
+generate
+  for (tlb=0; tlb < `PERSEUS_LS_L1_TLB_SIZE; tlb=tlb+1)
+  begin:snp_tmo_invalidate_vec_loop
+
+    assign snp_tmo_invalidate_vec_set_a1[tlb] =        snp_tmo_context_match_a1[tlb]
+                                                     & ~snp_tmo_va_valid
+                                                     & ~snp_tmo_va_valid_a2
+                                                     & any_tmo_inject_val_a1;
+
+    assign snp_tmo_invalidate_vec_set_a1_a2[tlb] =      snp_tmo_invalidate_vec_set_a1[tlb]
+                                                      | ( snp_tmo_va_valid_a2
+                                                          & (   (snp_tmo_tlb_hit_a2[tlb] & ~tlb_hit_a1_eq_wr_vec_a2)
+                                                             | (   tlb_smash_q[tlb]
+                                                                 & snp_tmo_va_smashed_entry_match_a2_q[tlb]
+                                                               )
+                                                           )
+                                                          & any_tmo_inject_val_a2
+                                                        );
+
+    assign snp_tmo_invalidate_vec_nxt[tlb]   =    (  (   (snp_tmo_invalidate_vec_set_a1_a2[tlb] & tlb_val_q[tlb] & ~snp_tmo_invalidate_vec_q[tlb])
+                                                       | (snp_tmo_invalidate_vec_q[tlb]  & ~snoop_sync_inv_tlb_i2)
+                                                     )
+                                                    & ~tlb_invalidate_vec_pre[tlb]
+                                                    & ~wr_tlb_en_t4[tlb]
+                                                  )
+                                                | ((resp_mark_invalid_final_t4 | snp_tmo_invalidate_vec_set_a1[tlb]) & wr_tlb_en_t4[tlb]);
+
+  end
+endgenerate
+```
+
+**RTL excerpt (invalidate flop + commit).**
+
+```systemverilog
+// file:perseus_ls_tlb.sv:L12361-L12378 + L12416-L12420
+assign snp_tmo_vec_upd_en =   (any_tmo_inject_val_a1 & ~snp_tmo_va_valid)
+                            | snp_tmo_va_valid_a2
+                            | tlb_wr_val_t4
+                            | snoop_sync_inv_tlb_i2
+                            | tlb_invalidate_en;
+
+  always_ff @(posedge clk or posedge reset_i)
+  begin: u_snp_tmo_invalidate_vec_q_44_1_0
+    if (reset_i == 1'b1)
+      snp_tmo_invalidate_vec_q[(`PERSEUS_LS_L1_TLB_SIZE-1):0] <= `PERSEUS_DFF_DELAY {44{1'b0}};
+    else if (snp_tmo_vec_upd_en == 1'b1)
+      snp_tmo_invalidate_vec_q[(`PERSEUS_LS_L1_TLB_SIZE-1):0] <= `PERSEUS_DFF_DELAY snp_tmo_invalidate_vec_nxt[(`PERSEUS_LS_L1_TLB_SIZE-1):0];
+  end
+
+// commit: L13641 (tlb_valid_din = tlb_val_q[tlb] & ~tlb_invalidate_vec[tlb] | wr_tlb_en_t4[tlb])
+//         L12416 (tlb_replace_inv_any = crid_table_replace_en_a1_q | scrub_all_tlb | snoop_sync_inv_tlb_i2)
+```
+
+**Line-by-line.**
+- `snp_tmo_invalidate_vec_set_a1[tlb]` — context-match at a1: set if the TMO-op's context matches this entry's CRID **and** the TMO doesn't need a VA compare (`~snp_tmo_va_valid`).
+- `snp_tmo_invalidate_vec_set_a1_a2[tlb]` — extends a1 set to the a2 VA-qualified case: either the a2-flopped "VA valid" TMO hits this entry's tag (regular TLBI-by-VA) **or** the entry is a smashed big-page and the smashed-VA-range match asserts.
+- `snp_tmo_invalidate_vec_nxt[tlb]` — latch-set/hold logic: (new-set OR currently-set unless `snoop_sync_inv_tlb_i2` clears) gated by `~tlb_invalidate_vec_pre` (non-TMO invalidate wins) and `~wr_tlb_en_t4` (don't invalidate the slot being simultaneously filled, unless the fill itself is marked invalid — `resp_mark_invalid_final_t4`, L12318).
+- `snp_tmo_invalidate_vec_q` flop-commits on `snp_tmo_vec_upd_en` — asserted on TMO inject, TMO a2 valid, fill write, snoop-sync-inv, or generic invalidate.
+- Final commit: `tlb_val_q[tlb]` next-state is `tlb_val_q & ~tlb_invalidate_vec[tlb] | wr_tlb_en_t4[tlb]` (L13641) — invalidate-bit wins over hold, write wins over invalidate.
+
+**Design rationale.**
+- **Why latch-and-hold the invalidate vector across ≥1 cycle.** TMO operations may span multiple cycles (context-match at a1, VA-match at a2, flush window closure). A held vector allows the CAM hit at a future a2 to be suppressed as soon as the TMO arrives, before the actual `tlb_val_q` clears, providing single-cycle TLBI-to-no-hit response.
+- **Why the complex `~wr_tlb_en_t4 ... | (resp_mark_invalid_final_t4 & wr_tlb_en_t4)` guard.** A simultaneous fill into a slot that the TMO has flagged for invalidation must be honoured: the entry is written *and then* invalidated (or the write is marked-invalid up-front). This encoding handles the race without dropping either the fill or the invalidate.
+
+This resolves Gate 6 §6.5's **"exact entry-clear cycle span relative to snp_tmo_va_valid rising edge"** UNVERIFIED: the span is **1–2 cycles** — `snp_tmo_invalidate_vec_q` latches on the cycle of `snp_tmo_va_valid_a2=1` (or a1 context-match-only case), then commits to `tlb_val_q` on the next `clk` edge via `tlb_valid_din`.
+
+---
+
+## §9 状态机 (Finite-State Machines)
+
+> Scope: enumerate every non-trivial multi-cycle state held inside `ls_tlb`. A top-level `typedef enum` grep (Gate 6 Step 5) returned 0 hits — the module expresses its FSMs through flop-set + combinational-next pattern, not SV enum. This section abstracts three such FSMs into explicit state tables + ASCII transition diagrams. Each is grounded in `_q` flops that already appeared in §7–§8.
+
+### §9.1 Outstanding-miss slot FSM (4 independent instances, one per slot `i∈{0,1,2,3}`)
+
+**Home flop.** `outstanding_miss_valid_q[i]` (`L1794`), plus the payload sidecar flops (va, crid, uid, rid, type, at_op, sec, spe_buf, tbe_buf, page_split2, no_alloc, resp_info_no_alloc, mark_invalid, non_spec_req, tmo_exact_match) that together form one "slot" of the 4-deep MSHR-equivalent outstanding-walk table.
+
+**States (2).**
+
+| State | Meaning | Home-flop value |
+|-------|---------|-----------------|
+| `FREE` | Slot is available to accept a new miss allocation. | `outstanding_miss_valid_q[i] = 0` |
+| `BUSY` | Slot holds an in-flight walk awaiting `mm_ls_tlb_miss_resp_v` + `entry_to_free_dec_t3[i]`. | `outstanding_miss_valid_q[i] = 1` |
+
+**Transition RTL (next-state casez).**
+
+```systemverilog
+// file:perseus_ls_tlb.sv:L14805-L14816
+  always_comb
+  begin: u_outstanding_miss_valid_nxt_i
+    casez({ls_mm_tlb_miss_v_a2, mm_ls_tlb_miss_resp_v, ls_mm_idle_sys_req})
+      3'b??_1: outstanding_miss_valid_nxt[i] = 1'b0;                                                                // idle-sys forces all to FREE
+      3'b00_0: outstanding_miss_valid_nxt[i] = outstanding_miss_valid_q[i];                                         // hold
+      3'b01_0: outstanding_miss_valid_nxt[i] = (outstanding_miss_valid_q[i]&(~(entry_to_free_dec_t3[i])));           // free (resp)
+      3'b10_0: outstanding_miss_valid_nxt[i] = (outstanding_miss_valid_q[i]|entry_to_fill_dec_a2[i]);                // allocate
+      3'b11_0: outstanding_miss_valid_nxt[i] = ((outstanding_miss_valid_q[i]|entry_to_fill_dec_a2[i])&(~(entry_to_free_dec_t3[i]))); // alloc + free same cycle
+      default: outstanding_miss_valid_nxt[i] = {1{1'bx}};
+    endcase
+  end
+```
+
+**ASCII transition diagram.**
+
+```
+                   entry_to_fill_dec_a2[i] & ls_mm_tlb_miss_v_a2 & ~ls_mm_idle_sys_req
+               ┌────────────────────────────────────────────────────────────────────┐
+               ▼                                                                     │
+          ┌────────┐                                                           ┌────┴───┐
+  reset ─►│  FREE  │                                                           │  BUSY  │
+          │ (q=0)  │                                                           │ (q=1)  │
+          └────────┘◄─────────────────────────────────────────────────────────┘        │
+               ▲   entry_to_free_dec_t3[i] & mm_ls_tlb_miss_resp_v & ~ls_mm_idle_sys_req│
+               │   OR  ls_mm_idle_sys_req  (unconditional flush)                        │
+               └────────────────────────────────────────────────────────────────────────┘
+```
+
+**Triggers table.**
+
+| Transition | Predicate | RTL |
+|------------|-----------|-----|
+| FREE → BUSY | `ls_mm_tlb_miss_v_a2 & entry_to_fill_dec_a2[i] & ~ls_mm_idle_sys_req` | L14812–L14813 |
+| BUSY → FREE (normal) | `mm_ls_tlb_miss_resp_v & entry_to_free_dec_t3[i]` | L14811 |
+| BUSY → FREE (force) | `ls_mm_idle_sys_req` | L14810 |
+| BUSY → BUSY | `~(alloc \| free)` | L14810 |
+| FREE → FREE | `~alloc` | L14810 |
+
+**Lifecycle waveform (one slot).**
+
+```
+Cycle:                              T0 T1 T2 T3 T4 T5
+outstanding_miss_valid_q[0]         __|‾‾‾‾‾‾‾‾‾‾‾‾‾|_______
+entry_to_fill_dec_a2[0]             _|‾‾|__________________
+ls_mm_tlb_miss_v_a2                 _|‾‾|__________________
+mm_ls_tlb_miss_resp_v               ____________|‾‾|_______
+entry_to_free_dec_t3[0]             ____________|‾‾|_______
+state (abstract)                    F | B | B | B | F | F
+```
+(Allocate at T1; walk in flight T1–T3; response + free at T4; FREE again from T5.)
+
+### §9.2 TLB-fill staging FSM (`tlb_stg_flops_val_q`)
+
+**Home flop.** `tlb_stg_flops_val_q` (`L2445`). One bit. This is the t3→t4 pipeline valid that gates the TLB entry-array write (§8.1, §8.8) and also enables `clk_tlb_flops` (§7.1).
+
+**States (2).**
+
+| State | Meaning | Value |
+|-------|---------|-------|
+| `IDLE` | No fill in flight; `clk_tlb_flops` off. | `tlb_stg_flops_val_q = 0` |
+| `STAGED` | A fill was captured into `tlb_{va,crid,ps,...}_stg_t4_q` last cycle; `wr_tlb_en_t4[tlb]` will fire this cycle to commit to the entry. | `tlb_stg_flops_val_q = 1` |
+
+**Transition RTL.**
+
+```systemverilog
+// file:perseus_ls_tlb.sv:L12482-L12524
+assign tlb_stg_flops_val_nxt_early_t3 =  mm_ls_tlb_miss_resp_v
+                                        & (   ~resp_no_alloc_t3
+                                             & ( ~(saved_info_valid_q & (resp_uid_t3[`PERSEUS_UID] == saved_info_uid_q[`PERSEUS_UID])
+                                                                      & (resp_rid_t3 == saved_info_rid_q)
+                                                                     & ~(saved_flt_page_split2_q & ~resp_page_split2_t3)
+                                                  )
+                                                  & ~((eff_mmu_resp_flt_t3 | tlb_resp_at_op_t3) & resp_info_no_alloc_t3)
+                                                | tlb_resp_spe_buf_t3
+                                                | tlb_resp_tbe_buf_t3
+                                               )
+                                           );
+
+assign tlb_stg_flops_val_nxt_t3 =   tlb_stg_flops_val_nxt_early_t3
+                                 & ~(|(entry_to_free_dec_t3[`PERSEUS_LS_OUTSTANDING_REQ_MAX_CNT-1:0] & outstanding_miss_no_alloc_set[`PERSEUS_LS_OUTSTANDING_REQ_MAX_CNT-1:0]));
+
+  always_ff @(posedge clk or posedge reset_i)
+  begin: u_tlb_stg_flops_val_q
+    if (reset_i == 1'b1)
+      tlb_stg_flops_val_q <= `PERSEUS_DFF_DELAY {1{1'b0}};
+    else if (outstanding_miss_valid_non_static_flops_upd_en == 1'b1)
+      tlb_stg_flops_val_q <= `PERSEUS_DFF_DELAY tlb_stg_flops_val_nxt_t3;
+  end
+```
+
+**ASCII transition diagram.**
+
+```
+                 mm_ls_tlb_miss_resp_v & ~resp_no_alloc_t3 & ~page_split2_mismatch & ~no_alloc_race
+                 ───────────────────────────────────────────────────────────────────────────────►
+          ┌────────┐                                                               ┌──────────┐
+  reset ─►│  IDLE  │                                                               │  STAGED  │
+          │ (q=0)  │                                                               │  (q=1)   │
+          └────────┘◄─────────────────────────────────────────────────────────────┘          │
+                          unconditional one-cycle — next cycle commits to tlb_va_q[tlb]      │
+                          via wr_tlb_en_t4[victim]; STAGED always returns to IDLE next edge  │
+                          unless another mm_ls_tlb_miss_resp_v lands back-to-back            │
+```
+
+**Triggers table.**
+
+| Transition | Predicate | RTL |
+|------------|-----------|-----|
+| IDLE → STAGED | `mm_ls_tlb_miss_resp_v & ~resp_no_alloc_t3 & ~saved_info_conflict & ~no_alloc_race` | L12482–L12502 |
+| STAGED → IDLE | `~mm_ls_tlb_miss_resp_v` next cycle (most common) | L12501 |
+| STAGED → STAGED | back-to-back `mm_ls_tlb_miss_resp_v` | same |
+
+**Lifecycle.**
+
+```
+Cycle:                     T3    T4    T5
+mm_ls_tlb_miss_resp_v      |‾‾|________
+tlb_stg_flops_val_q        ____|‾‾|____
+clk_tlb_flops (gated)      ____|‾|_____   (one pulse, during STAGED)
+wr_tlb_en_t4[victim]       ____|‾‾|____
+tlb_va_q[victim] (commits) _______|‾‾‾  (flops on clk_tlb_flops edge inside STAGED)
+```
+
+This FSM is the **bridge between the MMU response timing and the entry-array write timing**, and also the clock-gate enable for `clk_tlb_flops` (§7.1). Its one-cycle natural decay means the entry-array is only clocked in the cycle that a commit is pending — the power-saving invariant.
+
+### §9.3 SPE VA→PA sampling FSM (`spe_va_to_pa_counter_active_q`)
+
+**Home flops.** `spe_va_to_pa_counter_active_q` (`L1976`), `spe_va_to_pa_counter_en_q` (`L1979`), `spe_va_to_pa_counter_q[11:0]` (the elapsed-cycle counter).
+
+**States (3, derived).**
+
+| State | `active_q` | `en_q` | Meaning |
+|-------|------------|--------|---------|
+| `IDLE` | 0 | 0 | No SPE sample pending. |
+| `ACTIVE` | 1 | 1 | SPE uop in flight between i2 issue and a2 translation complete; counter incrementing each cycle to measure VA→PA latency. |
+| `DONE` | 1 | 0 | Translation completed (`tlb_any_hit_lsN_a2` or abort), counter frozen awaiting `ls_spe_buffer_done` to drain. |
+
+**Transition RTL.**
+
+```systemverilog
+// file:perseus_ls_tlb.sv:L16541-L16584
+assign spe_va_to_pa_counter_stop =   ls0_spe_va_to_pa_counter_stop_pre_a2
+                                   | ls1_spe_va_to_pa_counter_stop_pre_a2
+                                   | ls2_spe_va_to_pa_counter_stop_pre_a2;
+
+assign spe_va_to_pa_counter_en_nxt =     spe_va_to_pa_counter_start_a1
+                                     |  (spe_va_to_pa_counter_en_q & ~(spe_va_to_pa_counter_stop | ls_spe_buffer_done));
+
+assign spe_va_to_pa_counter_active_nxt =    spe_va_to_pa_counter_start_a1
+                                          | (spe_va_to_pa_counter_active_q & ~(ls_spe_buffer_done));
+
+  always_ff @(posedge clk or posedge reset_i)
+  begin: u_spe_va_to_pa_counter_en_q
+    if (reset_i == 1'b1)
+      spe_va_to_pa_counter_en_q <= `PERSEUS_DFF_DELAY {1{1'b0}};
+    else if (spe_va_to_pa_counter_state_bits_clk_en == 1'b1)
+      spe_va_to_pa_counter_en_q <= `PERSEUS_DFF_DELAY spe_va_to_pa_counter_en_nxt;
+  end
+
+  always_ff @(posedge clk or posedge reset_i)
+  begin: u_spe_va_to_pa_counter_active_q
+    if (reset_i == 1'b1)
+      spe_va_to_pa_counter_active_q <= `PERSEUS_DFF_DELAY {1{1'b0}};
+    else if (spe_va_to_pa_counter_state_bits_clk_en == 1'b1)
+      spe_va_to_pa_counter_active_q <= `PERSEUS_DFF_DELAY spe_va_to_pa_counter_active_nxt;
+  end
+```
+
+**ASCII transition diagram.**
+
+```
+                   spe_va_to_pa_counter_start_a1
+          ┌──────────────────────────────────────────────────────┐
+          ▼                                                       │
+   ┌──────────┐     spe_va_to_pa_counter_stop     ┌────────┐     │
+   │   IDLE   │                                   │ ACTIVE │     │
+   │ a=0,e=0  │                                   │ a=1,e=1│     │
+   └──────────┘   ◄──────────────────────────────┐└────┬───┘     │
+          ▲      ls_spe_buffer_done              │     │         │
+          │                                      │     ▼  stop   │
+          │                                      │ ┌────────┐    │
+          └──────────────────────────────────────┘ │  DONE  │    │
+                     ls_spe_buffer_done            │ a=1,e=0│    │
+                                                   └────────┘    │
+                                                        ▲        │
+                                                        │        │
+                                                        └────────┘
+                                              (active_q stays 1
+                                               until buffer drain)
+```
+
+**Triggers table.**
+
+| Transition | Predicate | RTL |
+|------------|-----------|-----|
+| IDLE → ACTIVE | `spe_va_to_pa_counter_start_a1` (any of `spe_va_pa_counter_start_lsN_a1`, L16496) | L16552, L16567 |
+| ACTIVE → DONE | `spe_va_to_pa_counter_stop` (any of `lsN_spe_va_to_pa_counter_stop_pre_a2`, L16505/L16515/L16525) | L16550 |
+| DONE → IDLE | `ls_spe_buffer_done` | L16567, L16584 |
+| any → (clk-gated no-op) | `~spe_va_to_pa_counter_state_bits_clk_en` | L16547 |
+
+**Lifecycle waveform.**
+
+```
+Cycle:                                T0  T1  T2  T3  T4  T5  T6  T7
+spe_va_to_pa_counter_start_a1         __|‾‾|________________________
+spe_va_to_pa_counter_en_q             ____|‾‾‾‾‾‾‾‾‾|______________   (ACTIVE)
+spe_va_to_pa_counter_active_q         ____|‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾|____   (ACTIVE+DONE)
+spe_va_to_pa_counter_stop             ________________|‾‾|________
+tlb_any_hit_lsN_a2                    ________________|‾‾|________
+ls_spe_buffer_done                    ____________________|‾‾|____
+spe_va_to_pa_counter_q[11:0]          ==|=0=|=1=|=2=|=3=|=3=|=0=|==   (incr ACTIVE, frozen DONE, clear on done)
+state                                 I  | A | A | A | D | D | I
+```
+
+### §9.4 FSMs NOT located in `ls_tlb.sv`
+
+The plan Step 5 called out an "MTE address precommit FSM (`prec_mte_uid_vld_q`)". Grep finds `prec_mte_va_uid_q` and `prec_mte_uid_vld_q` only as **module inputs** (`L89–L90`) — the FSM itself lives upstream (likely `perseus_ls_dispatch` or `perseus_ls_mte_ctrl`). Inside `ls_tlb` these are purely consumer signals used by the MTE-check address path (e.g. `L15528+` near the nandgate instances). `(UNVERIFIED: inferred; the MTE precommit FSM is upstream of ls_tlb — Gate 10 integration walkthrough should point at the actual owning module. The signals land here as already-stable inputs.)`
+
+Also referenced — the `tbe_inject_reserve_slot_q` (L11493) and `crid_table_replace_en_a1_q` (L4563) are single-cycle captures (not multi-state FSMs) and are documented under §8.7 / §8.10 respectively.
+
+### §9.5 FSM summary
+
+| # | FSM | States | Home flop | Section | R7 lifecycle wave |
+|---|-----|--------|-----------|---------|--------------------|
+| 1 | Outstanding-miss slot (×4) | FREE / BUSY | `outstanding_miss_valid_q[i]` | §9.1 | §9.1 + §6.2 |
+| 2 | TLB-fill staging | IDLE / STAGED | `tlb_stg_flops_val_q` | §9.2 | §9.2 + §6.2 (T3/T4) |
+| 3 | SPE VA→PA sampling | IDLE / ACTIVE / DONE | `spe_va_to_pa_counter_active_q + en_q` | §9.3 | §9.3 |
+| 4 | Snoop-TMO invalidate vector (covered in §6.5 + §8.10) | tracked per-entry within `snp_tmo_invalidate_vec_q` | `snp_tmo_invalidate_vec_q[43:0]` | §8.10 | §6.5 |
+
+**UNVERIFIED items introduced in §7–§9 (Gate 9 tally):**
+- §7.3 — `cb_dftramhold` has no functional reference inside `ls_tlb.sv` body; consumed only inside the clock-gate cell's DFT path. Pending Gate 10 integration walkthrough.
+- §8.1 — Total per-entry bit count including sibling PA + permission + attribute captures is not exhaustively tallied (visible generate-loop subtotal = 48 bits across 8 fields).
+- §8.6 — Full 24-way permission combinational block (8 narrow AP/UXN/PXN predicates × 3 pipes) not individually quoted; topology located and cited.
+- §9.4 — MTE-precommit FSM owning module not located; inputs land at `L89–L90` from upstream.
+
+**UNVERIFIED items resolved at Gate 9:**
+- §1 `(UNVERIFIED: whether ls_tlb uses RRIP, pseudo-LRU, or random replacement)` — **RESOLVED §8.9** as second-chance / CLOCK (1-bit per entry + high/low table priority-encoded scan + linear-scan fallback).
+- §1 "inline replacement logic scan is deferred to Gate 9 §8" — **RESOLVED §8.9**.
+- Gate 7/8 "44-entry bit layout" — **PARTIALLY RESOLVED §8.1 / §7.4** (8 per-entry fields identified with widths: valid/va/crid/ps/smash/global/dev_htrap/fwb_override = 48 bits visible; PA + permission captures stored per-pipeline at a2, not in the entry array).
+- Gate 6 §6.3 "exact combinational AP/PAN/UAO span" — **PARTIALLY RESOLVED §8.2 / §8.6** (address-match span located; full permission AP/UXN/PXN semantics flagged as lower-priority).
+- Gate 6 §6.5 "exact entry-clear cycle span relative to snp_tmo_va_valid" — **RESOLVED §8.10** as 1–2 cycles (a1/a2 set of vector → next-edge commit to `tlb_val_q`).
+
+---
+
+*End of §7–§9 (Gate 9). §10–§14 will be authored in Task 11 (Gate 10).*
 
