@@ -698,7 +698,143 @@ Allocation latency: `perseus_ls_age_matrix.sv:L152–L168` vs
 
 ---
 
-<!-- §7–§8 to be written in Task 6 (Gate 5) -->
-<!-- §7: ls_lrq instantiation context (AM_SIZE=16, port binding, surrounding logic, waveform illustration) -->
-<!-- §8: summary / primitive-reuse guidance across LSU pools -->
+## §7 Instantiation Catalog
 
+This section enumerates *every* instantiation of `perseus_ls_age_matrix`
+in the LSU RTL release under inspection (`MP128-r0p3-00rel0-2 /
+MP128-BU-50000-r0p3-00rel0`), with each consumer's `AM_SIZE`, source-port
+wiring, class-group assignment, and role. The ground-truth list below was
+produced by `grep -rn 'perseus_ls_age_matrix'` over
+`perseus/logical/perseus_loadstore/verilog/` and inspecting 30 lines of
+context at every hit.
+
+### §7.1 Ground-truth catalog
+
+| Consumer module    | `AM_SIZE` (resolved)                              | Instance name             | Source location                    | Role                                                                                 | Status in this pilot            |
+|--------------------|---------------------------------------------------|---------------------------|------------------------------------|--------------------------------------------------------------------------------------|---------------------------------|
+| `perseus_ls_fb`    | `16`                                              | `u_fb_age_matrix`         | `perseus_ls_fb.sv:L8526`           | Fill-Buffer oldest arbitration; per-L2-bank oldest (groups a–d = l2bank 0..3)        | **In-scope reference** (this doc, §1–§6) |
+| `perseus_ls_pf`    | `` `PERSEUS_LS_PF_TRAIN_BUFFER_SIZE `` = **4**    | `u_train_buf_age_matrix`  | `perseus_ls_pf.sv:L3762`           | Prefetch training buffer oldest selection; class groups all tied to zero            | Deferred (named only)           |
+| `perseus_ls_prq`   | `` `PERSEUS_LS_PRQ_SIZE `` = **8**                | `u_prq_age_matrix`        | `perseus_ls_prq.sv:L409`           | Pending Request Queue oldest; single alloc source (`prq_alloc_a5`), groups tied 0    | Deferred (named only)           |
+| `perseus_ls_snoop` | `` `PERSEUS_LS_SNPQ_SIZE_TOTAL `` = **7** (4+3)   | `u_snpq_age_matrix`       | `perseus_ls_snoop.sv:L3858`        | Snoop Queue oldest; group_a = DVM class, group_b = cache-snoop class                | Deferred (named only)           |
+
+Macro resolution evidence:
+- `` `PERSEUS_LS_PF_TRAIN_BUFFER_SIZE = 4 `` — `perseus_ls_defines.sv:L1041`.
+- `` `PERSEUS_LS_PRQ_SIZE = 8 `` — `perseus_ls_defines.sv:L1104`.
+- `` `PERSEUS_LS_SNPQ_SIZE_TOTAL = (4+3) = 7 `` — `perseus_ls_defines.sv:L874`.
+- `AM_SIZE=16` for `u_fb_age_matrix` is a literal integer at the instantiation site.
+
+### §7.2 Correction to Gate-3 consumer assumptions
+
+Sections §1 (Positioning table) and §3.3 (Instantiation sizes table) were
+authored under the design-spec §5.2 assumption that the three age-matrix
+consumers in the LSU are `ls_lrq` (16), `ls_sab` (24), and `ls_rar` (40).
+The ground-truth grep above **contradicts this**: none of `perseus_ls_lrq.sv`,
+`perseus_ls_sab.sv`, or `perseus_ls_rar.sv` instantiates
+`perseus_ls_age_matrix` at all (verified by `grep -n 'age_matrix\|age_mtx'`
+on those three files — zero hits). The actual consumers are `ls_fb`,
+`ls_pf`, `ls_prq`, and `ls_snoop`, with sizes 16 / 4 / 8 / 7.
+
+Per the pilot plan's "RTL wins over spec" rule, the Gate-3 UNVERIFIED flags
+on consumer sizes are **resolved here** and superseded by §7.1. The §1 and
+§3.3 tables remain as authored to preserve the Gate-3 audit trail; the
+reader should treat §7.1 as the authoritative catalog for any downstream
+work. The updated UNVERIFIED summary is collected in §8.3 below.
+
+### §7.3 Per-instance wiring highlights
+
+**`u_fb_age_matrix` (AM_SIZE=16, `perseus_ls_fb.sv:L8526`).** Three live
+alloc sources (`ls0/1/2_alloc_fb_entry_d3`), source 3 tied to zero;
+cross-port hints (`ls0/1/2_older_d3_q`) are live and drive pairwise
+age decisions across the three load-store pipes. Four class groups are
+wired to the four L2-bank masks (`fb_entry_l2bank0..3`), giving a
+per-L2-bank oldest output used by downstream bank arbiters.
+`entry_awaiting_resp` is wired to `fb_entry_awaiting_cracked_dev`, so
+`resp_oldest_entry` selects the oldest device/cracked-access waiter.
+
+**`u_train_buf_age_matrix` (AM_SIZE=4, `perseus_ls_pf.sv:L3762`).**
+Smallest instance. Three alloc sources (`p0/1/2_train_buf_alloc_entry`),
+one tied to zero. Cross-port hints are fixed constants
+(`src0_older=4'b1110`, `src1_older=4'b1100`, `src2_older=4'b1000`,
+`src3_older=4'b0000`) — a static triangular priority ordering
+src0 > src1 > src2 > src3, used because the prefetch-training buffer
+does not have a dynamic age relationship among concurrent trainers.
+All four class groups and `entry_awaiting_resp` are tied to zero; only
+the primary `oldest_entry` cone is used.
+
+**`u_prq_age_matrix` (AM_SIZE=8, `perseus_ls_prq.sv:L409`).** Single
+live alloc source (`prq_alloc_a5` on src0); the other three
+`src*_alloc_entry` are tied to zero. The cross-port hint constants are
+identical to the PF instance (static triangular) but vacuous because
+only src0 ever allocates. All four class groups tied to zero; primary
+and `resp_oldest_entry` cones are active.
+
+**`u_snpq_age_matrix` (AM_SIZE=7, `perseus_ls_snoop.sv:L3858`).** Two
+live alloc sources (`alloc_snp_entry` on src0, `alloc_snp_self_entry`
+on src1); src2/src3 tied to zero. Cross-port hints are the same static
+constants. Group_a is driven by `group_a_entry` (DVM class — TLBI / CPP
+excluded), group_b by `~tlbi & ~cpp` (cache-snoop class); group_c/d are
+tied to zero. `entry_awaiting_resp` is wired to `dvm_entry_needs_resp`,
+so `resp_oldest_entry` selects the oldest DVM waiter.
+
+**Evidence.** Port bindings inspected by
+`sed -n '<L-3>,<L+20>p'` at each instantiation line above.
+
+---
+
+## §8 Verification Concerns (Testpoint Seeds)
+
+This section seeds a testpoint list for the primitive itself (not for
+any one consumer — consumer-specific scenarios belong in their own
+module docs). Each testpoint names the RTL layer (§5.1–§5.5) it
+exercises. These are *seeds*, not a complete verification plan; a DV
+engineer is expected to expand each bullet into concrete stimulus and
+checker pseudocode.
+
+### §8.1 Primitive testpoints
+
+| ID           | Scenario                                                                                                                                             | Expected behaviour                                                                                                                                       | RTL layer                              |
+|--------------|------------------------------------------------------------------------------------------------------------------------------------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------|----------------------------------------|
+| `AGEMTX-TP-01` | Single-source sequential allocation: drive `src0_alloc_entry` one-hot at rows 0, 1, 2, …, N−1 in successive cycles, with `entry_v` accumulating.    | After cycle *k*, `oldest_entry` is 1-hot at row 0 for the primary cone while rows 0..k are live and `entry_needs_arb` is all 1.                           | L1, L2, L3, L5                         |
+| `AGEMTX-TP-02` | Out-of-order dealloc via `entry_v`: after TP-01 fills rows 0..N−1, clear `entry_v[0]` (leave `entry_v[1..N-1]=1`).                                   | Same cycle, `oldest_entry` transitions 1-hot to row 1. Row 0's age-matrix flops retain their state (no row-0 alloc this cycle) but are masked by `entry_v`. | L4 (mask), L5                          |
+| `AGEMTX-TP-03` | 4-source concurrent allocation into 4 distinct empty rows with consistent `src_k_older` hints (pairwise `src_k_older[j] = ~src_j_older[k]`).         | The implied total order across the four new rows is respected by `oldest_entry` in subsequent cycles; antisymmetry assertion `A[i][j] xor A[j][i]` holds for every pair. | L1 (pairwise), L2, L3                  |
+| `AGEMTX-TP-04` | Dynamic class-group membership: allocate N entries, mark a rotating subset as `entry_group_a`; toggle the group-a membership of interior rows.      | `group_a_oldest_entry` tracks the oldest *currently in group_a* independently of the primary `oldest_entry`; the two cones disagree whenever group_a excludes the global oldest. | L4 (hold/set split), L5                |
+| `AGEMTX-TP-05` | Reset release: drive `reset_i=1` for multiple cycles, then deassert and allocate row *r* via `src0_alloc_entry` on the very first post-reset cycle. | After allocation, the next cycle's `oldest_entry` is 1-hot at row *r*; all other upper-triangle flops remain the reset value 0 (no spurious ordering).    | L3 (async reset), L5                   |
+| `AGEMTX-TP-06` | Row-level clock-gate correctness: allocate only into *low* rows (`r < N/2`) for many cycles, then query `oldest_entry` while *high* rows are live.  | High-row flops (whose `matrix_row_en` remained asserted only when a column-in-their-slice was written) still produce correct transposed-column reads; no stale high-row cells corrupt `oldest_entry`. | L3 (`matrix_row_en`, L149), L5         |
+| `AGEMTX-TP-07` | XPROP mode (`PERSEUS_XPROP_FLOP` defined): drive `matrix_row_en[row]` to X (e.g. via X on an `src_k_alloc_entry` bit).                               | The `else` arm at `perseus_ls_age_matrix.sv:L166` loads `1'bx` into that row-slice; `oldest_entry` for affected cones propagates X, surfacing as a simulation X-check fail. | L3 (XPROP branch)                      |
+| `AGEMTX-TP-08` | Same-cycle alloc + dealloc: allocate row *r* via `src0_alloc_entry[r]=1` while `entry_v[r]` is simultaneously deasserted (caller "fire-and-forget"). | `alloc_entry[r]` still wins — the row's flop is written this cycle — but the primary cone masks it out via `entry_v` at `L176`. `oldest_entry` ignores row *r*. Pairing checks: `entry_v` contract (§6.1 item 5) is not violated. | L1, L2, L4                             |
+| `AGEMTX-TP-09` | `resp_oldest_entry` when `entry_awaiting_resp` is all zero.                                                                                          | `resp_oldest_entry` is all-zero for the same cycle — no row wins because `resp_matrix_eff_set` ORs in `~entry_awaiting_resp[row]` for every row (L188), and `resp_matrix_eff_hold` ANDs in `entry_awaiting_resp[col]` (L181), so every row's row-zero reduction fails. (UNVERIFIED: the row *N−1* corner case uses only the column-of-ones conjunct at L244; need to cross-check that `resp_matrix_eff_col[N-1][:]` transposes through a `_set` term that is all-1 when `entry_awaiting_resp=0` — by inspection of L188 the `_set` row for `row=N−1` is length-zero, so the conjunct `&resp_matrix_eff_col[N-1][N-2:0]` falls back to the hold term, which is zero ⇒ `resp_oldest_entry[N-1]=0`. Confirmed by eyeballing L453/L461; flag as UNVERIFIED pending formal check.) | L4 (`resp_*` cone), L5                 |
+| `AGEMTX-TP-10` | Parameter sweep: re-elaborate with `AM_SIZE ∈ {4, 7, 8, 16}` (the four in-tree sizes from §7.1) and rerun TP-01/02 smoke.                            | All four sizes synthesise without elaboration warnings; TP-01/02 pass on each. Catches accidental AM_SIZE-specific constants in the RTL.                  | All layers (parametric smoke)          |
+| `AGEMTX-TP-11` | Pairwise-inconsistent `src_k_older` hints (contract violation, negative test): drive `src0_older[1]=1` and `src1_older[0]=1` simultaneously with both ports allocating. | The resulting age matrix becomes asymmetric; `oldest_entry` may be multi-hot or all-zero depending on reduction. Expected: a caller-side assertion in the consumer fires *before* the primitive sees the bad hints; if the primitive is driven directly, the test captures the corruption as a one-hot checker failure. | L1 (pairwise invariant), §6.1 item 1   |
+
+(Total: 11 primitive testpoint seeds. TP-01/02 cover the basic single-source
+lifecycle; TP-03/11 cover the 4-way allocation pairwise invariant; TP-04
+covers the group cones; TP-05/07 cover reset and XPROP; TP-06 covers the
+row-level clock gate; TP-08/09 cover cone-mask corners; TP-10 is a
+parameter-variant smoke.)
+
+### §8.2 Out-of-scope for this primitive's testpoints
+
+The following belong to consumer-level (FB / PF / PRQ / SNPQ) testpoint
+lists, not to this document:
+
+- The semantic correctness of each consumer's `entry_group_*` mapping
+  (e.g. L2-bank assignment for FB, DVM-class vs cache-snoop-class for
+  SNPQ) — those are consumer ordering requirements, not primitive behaviour.
+- Replay / arbitration-grant downstream of `oldest_entry` — this is
+  consumer arbitration, not age-matrix output.
+- Pipeline latency alignment between `src_k_alloc_entry` and the
+  `entry_v`/`entry_needs_arb`/`entry_group_*` predicates — this is a
+  consumer timing concern (§6.2 bullet 3 of this doc identifies it but
+  the check belongs in each consumer's TP list).
+
+### §8.3 Consolidated UNVERIFIED summary
+
+| Location                        | Claim                                                                                                                              | Gate-5 status                                                                                                                                      |
+|---------------------------------|------------------------------------------------------------------------------------------------------------------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------|
+| §1 / §3.3 (Gate 3)              | Consumers are `ls_lrq`=16, `ls_sab`=24, `ls_rar`=40 (from design spec §5.2).                                                       | **Resolved — contradicted by RTL.** Actual consumers are `ls_fb`=16, `ls_pf`=4, `ls_prq`=8, `ls_snoop`=7 (see §7.1). `ls_lrq`/`ls_sab`/`ls_rar` do not instantiate this primitive. |
+| §4.2 (Gate 4)                   | Convention that `src_k_older[k]` self-bit is unread.                                                                               | Open — not re-verified in this gate; still informational. Pilot-scope OK.                                                                          |
+| §5.3 (Gate 4)                   | `PERSEUS_DFF_DELAY` / `PERSEUS_XPROP_FLOP` definitions in header.                                                                  | Open — conventions stated; header file not re-inspected.                                                                                           |
+| §6.1 item 6 (Gate 4)            | `AM_SIZE=1` degenerate size support is untested (no explicit assertion in RTL).                                                    | Open — in-tree min size is 4 (PF train buf), so `AM_SIZE=1` is operationally unreachable; flag retained for primitive-reuse guidance.              |
+| §8.1 TP-09                      | Row `N−1` corner behaviour for `resp_oldest_entry` when `entry_awaiting_resp` is all-zero.                                         | Open — eyeballed; DV should formally check.                                                                                                        |
+
+---
