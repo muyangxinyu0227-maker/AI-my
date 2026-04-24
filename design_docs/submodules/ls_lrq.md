@@ -198,8 +198,6 @@ Functional-equivalence argument to the matrix model, and the naming of the
 
 ---
 
-<!-- §5 onwards deferred to Tasks 14-18 (Gates 13-17). Do not fill here. -->
-
 ## §3 微架构抽象 (Microarchitectural Abstraction)
 
 > Framing reminder (per R5 and the document header): the design spec is the
@@ -497,4 +495,745 @@ has not yet been proved in this document — forward reference to §5 and
 
 ---
 
-<!-- §5 onwards deferred to Tasks 14-18 (Gates 13-17). Do not fill here. -->
+## §5 接口列表 (Interface List)
+
+> Ports are taken verbatim from the module header of
+> `perseus_ls_lrq.sv` (lines 35-1105 in the
+> `PERSEUS-MP128-r0p3-00rel0` snapshot). Because the module has on the
+> order of ~460 ports (three load pipes × many per-uop signals + L2
+> response + pipeline d0 issue + FB/FSM/DFT), we group them by
+> functional domain rather than list them in declaration order. Widths
+> are given as declared (parameter macros kept symbolic); stages use
+> Perseus LS stage names (i1/i2/i3, a1/a2/a3, d0/d1, m2/m3/m4/m5). For
+> signals whose "active stage" is not literally part of the suffix,
+> the active stage is inferred from the usage and flagged
+> `UNVERIFIED`.
+>
+> **Snapshot qualifier.** Exact line numbers, group sizes, and the
+> existence/absence of specific debug/MBIST pins are all taken from the
+> `PERSEUS-MP128-r0p3-00rel0` snapshot; a different release tag may
+> differ.
+
+### §5.1 Input ports
+
+#### §5.1.1 Clock / reset / DFT / chicken-bits
+
+| Signal | Width | Source | Active stage | Purpose |
+|---|---|---|---|---|
+| `clk` | 1 | SoC clocking | all | Module clock. `perseus_ls_lrq.sv:L35` |
+| `cb_dftcgen` | 1 | DFT controller | all | Clock-gate cell DFT override. `L36` |
+| `reset_i` | 1 | SoC reset | sync | Synchronous reset (all `_q` state cleared). `L37` |
+| `chka_disable_ls_rcg` | 1 | Chicken reg | all | Disable LS regional clock-gating. `L39` |
+| `ls_disable_nc_spec_req` | 1 | Chicken reg | a2/d0 | Disable speculative NC/Device requests. `L40` |
+| `ls_gre_ldnp_overread_disable` | 1 | Chicken reg | d0 | Suppress GRE LDNP over-read. `L42` |
+| `ls_enable_serialize_gather` | 1 | Chicken reg | a2 | Serialise SVE gather instead of LRQ-parallel. `L43` |
+| `ls_disable_lrq_wait_l2resp_timeout` | 1 | Chicken reg | any | Disable `WAIT_L2RESP` timeout. `L45` |
+| `ls_enable_lrq_wait_l2resp_tofu_timeout` | 1 | Chicken reg | any | Enable TOFU-scoped `WAIT_L2RESP` timeout. `L46` |
+| `ls_disable_precise_stdata_wakeup` | 1 | Chicken reg | any | Force non-precise STDATA wakeup. `L47` |
+| `ls_disable_multi_fb_link1` | 1 | Chicken reg | d0 | Disable multi-FB linking for unalign1. `L49` |
+| `ls_enable_spot_fix1` / `ls_enable_spot_fix2` | 1 each | Chicken reg | any | Spot-fix enables. `L51-52` |
+| `ls_revert_lrq_link_clr_to_arb` | 1 | Chicken reg | d0 | Revert link-clear to arb-time behaviour. `L53` |
+| `ls_disable_lrq_alloc_dg` | 1 | Chicken reg | a2 | Disable alloc data-gating. `L55` |
+
+#### §5.1.2 Global state / system-config
+
+| Signal | Width | Source | Active stage | Purpose |
+|---|---|---|---|---|
+| `eff_big_endian_q` | 1 | Sys-reg | any | Effective big-endian for load data. `L57` |
+| `sctlr_el2_ee` | 1 | Sys-reg | any | EL2 endianness override. `L59` |
+| `nested_virt_op_ls{0,1,2}_a2_q` | 1 each | Sys-reg / decode | a2 | Nested-virt per-pipe flag. `L61-63` |
+| `ls_lrq_timeout_tick_tock_change_q` | 1 | Timeout FSM | any | Tick-tock change event (livelock/timeout). `L65` |
+| `ls_tick_tock_q` | 1 | Global counter | any | Global tick-tock phase. `L66` |
+| `fb_empty` | 1 | FB unit | any | Fill-buffer completely empty. `L67` |
+
+#### §5.1.3 Age / ordering (pipeline-level)
+
+> These are allocator-pair "younger-than" signals — per §3.4, the LRQ
+> does **not** instantiate `age_matrix(16)` in this RTL snapshot; the
+> 3-way allocator age uses these inputs plus the pairwise comparator
+> farm at `perseus_ls_lrq.sv:L4636-L5038`.
+
+| Signal | Width | Source | Active stage | Purpose |
+|---|---|---|---|---|
+| `ls0_uop_older_than_ls1_a1_q` | 1 | AGE matrix (outside LRQ) | a1 | Pipe-pair ordering used by allocator. `L69` |
+| `ls1_uop_older_than_ls2_a1_q` | 1 | AGE matrix | a1 | Pipe-pair ordering. `L70` |
+| `ls0_uop_older_than_ls2_a1_q` | 1 | AGE matrix | a1 | Pipe-pair ordering. `L71` |
+| `disable_lrq1_pick_nxt` / `disable_lrq0_pick_nxt` | 1 | Arb control | d0 | Force d0 picker to skip lrq0/lrq1 this cycle. `L72-73` |
+| `block_ls_1` / `block_ls_2` | 1 | Upstream | a2 | Block ls1/ls2 allocation. `L74-75` |
+| `direct_blk_en` | 1 | Upstream | a2 | Direct block enable. `L76` |
+
+#### §5.1.4 SB / precommit / tofu / retirement
+
+| Signal | Width | Source | Active stage | Purpose |
+|---|---|---|---|---|
+| `sb_raw_dealloc_ptr` | `STID` | SB | any | Store-buffer RAW dealloc pointer. `L78` |
+| `sb_wr_mb_ptr_stid_w3_q` | `STID` | SB | w3 | SB write-MB pointer (stid). `L80` |
+| `precommit_uid_q` | `UID` | Retire | any | Global precommit UID pointer. `L83` |
+| `ct_tofu_vld`, `ct_tofu_uid` | 1, `UID` | Commit | any | Commit-side "take-over-from-LS" event. `L86-87` |
+| `ct_ls_oldest_unrslvd_is_ld` | 1 | Commit | any | Oldest unresolved op at retire is a load. `L88` |
+| `ls_prevent_load_pass_store_a2_q` | 1 | Order ctrl | a2 | Block load-passes-store at alloc. `L102` |
+
+#### §5.1.5 Livelock / FB / credit
+
+| Signal | Width | Source | Active stage | Purpose |
+|---|---|---|---|---|
+| `trigger_mid_range_livelock_buster` | 1 | Livelock detect | any | External livelock buster trigger. `L90` |
+| `fb_available` | 1 | FB | any | At least one FB entry free. `L92` |
+| `nc_fb_credit_return_pending_q` | 1 | FB | any | NC FB credit return in flight. `L93` |
+| `evict_rd_req_v_d0`, `capacity_evict_rd_req_v_d0` | 1 | d0 arb | d0 | Evict-read arb conflict hints. `L94-95` |
+| `fb_any_valid_nc_dev_entry_dly_q` | 1 | FB | any | Any NC/Dev FB entry live (delayed). `L681` |
+| `fdb_holding_credit_q` | 1 | FDB | any | FDB holds credit. `L683` |
+| `fb_fill_wb_mem_m4` | 1 | FB/L2 | m4 | FB fill WB-memory at m4. `L698` |
+| `fill_resp_rst_index_m4`, `fb_fill_index_m4` | 1,1 | FB | m4 | Fill response/fill index bit (line-offset select). `L700-701` |
+
+#### §5.1.6 ls0 pipeline inputs — i2/a1/a2 allocation stage
+
+> The ls0/ls1/ls2 groups mirror each other; only ls0 is tabulated in
+> detail, with a "mirror" row for ls1/ls2.
+
+| Signal | Width | Source | Active stage | Purpose |
+|---|---|---|---|---|
+| `ls0_uid_a1_q` | `UID` | Rename/IS | a1 | Load uop UID at a1. `L115` |
+| `ls0_block_lrq_alloc_a2_q` | 1 | ls0 pipe | a2 | Block LRQ alloc for ls0. `L118` |
+| `uid_ls0_i2_q`, `issue_ld_val_ls0_i2` | `UID`, 1 | IS | i2 | i2 UID + valid. `L120-121` |
+| `ld_val_ls0_a2_q`, `ld_val_ls0_a2` | 1,1 | a2 | a2 | Load valid a2 (reg/comb). `L125, L129` |
+| `ls0_ld_cross_16_32_byte_a2_q`, `ls0_ld_cross_32_byte_a2_q` | 1,1 | a2 | a2 | Cross-boundary flags. `L126-127` |
+| `issue_v_ls0_ld_a1_q`/`a2_q`/`a2` | 1 each | IS | a1/a2 | Issue-valid pipeline copies. `L130-132` |
+| `iq0_oldest_ql_a1` | 1 | IQ | a1 | IQ0 oldest-ql. `L133` |
+| `ls0_ld_page_split1_a1`, `ls0_ld_page_split1_a2`, `ls0_ld_page_split2_a2` | 1 each | TLB/AGU | a1/a2 | Page-split variants. `L135, L141-142` |
+| `ls0_ld_ssbb_blk_a2_q` | 1 | Ordering | a2 | SSBB block. `L137` |
+| `ls0_stid_a2_q` | `STID` | SB | a2 | Store-buffer tag. `L139` |
+| `ls0_srca_hash_a2_q` | 5 | AGU | a2 | src-a hash for RAW matching. `L140` |
+| `ls0_ld_unalign1_a2`, `ls0_ld_unalign2_a2` | 1,1 | a2 | a2 | Unaligned halves. `L143-144` |
+| `ls0_cache_line_split_a2_q` | 1 | a2 | a2 | 64B line split. `L145` |
+| `mte_access_ls0_a2`, `mte_prc_mode_ls0_a2`, `mte_allow_flt_ls0_a2` | 1,1,1 | MTE | a2 | MTE ctrl. `L147-149` |
+| `ls0_ltag_a2_q` | 4 | MTE | a2 | Logical tag. `L150` |
+| `xlat_unpriv_ls0_a2_q` | 1 | TLB | a2 | Unpriv translation. `L151` |
+| `ls0_mte_war_nuke_nxt_d4` | 1 | MTE | d4 | MTE WAR nuke next cycle. `L153` |
+| `ls0_precommit_uop_a2_q` | 1 | Commit | a2 | Uop is precommitted. `L155` |
+| `lor_id_ls0_a2`, `lor_match_ls0_a2` | `LOR_ID`,1 | LOR | a2 | LOR id + match. `L158-159` |
+| `ls0_abort_early_indicator_adjusted_a2`, `ls0_prc_abort_adjusted_ql_a2` | 1,1 | Abort ctrl | a2 | Early abort hints. `L161-162` |
+| `ls0_ld_uid_a2_q`, `ls0_rid_a2_q` | `UID`,1 | a2 | a2 | Load UID + replay id. `L163-164` |
+| `ls0_ld_instr_id_a2_q` | 64 | Rename | a2 | Opaque instr id. `L166` |
+| `pbha_ls0_a2` | `PBHA_RANGE` | TLB | a2 | PBHA attribute. `L169` |
+| **ls1/ls2 mirror** | — | — | — | Every signal above repeats for ls1 (`L175-231`) and ls2 (`L235-291`). |
+
+#### §5.1.7 ls{0,1,2} pipeline inputs — a2/a3/d2/d3/d4
+
+| Signal | Width | Source | Active stage | Purpose |
+|---|---|---|---|---|
+| `outer_alloc_ls0_a2` | 1 | a2 | a2 | Outer-shared alloc. `L303` |
+| `cache_attr_ls0_a2` | `LSL2_CACHE_ATTR` | TLB/PT | a2 | Cache attribute. `L306` |
+| `share_attr_ls0_a2` | 2 | TLB/PT | a2 | Shareable attribute. `L307` |
+| `tlb_any_hit_ls0_a2`, `tlb_one_or_more_hits_ls0_a2` | 1,1 | TLB | a2 | TLB hit flags. `L308-309` |
+| `ls0_split_lane_vld_a2_q` | 1 | SVE ctrl | a2 | Split-lane valid. `L310` |
+| `ldg_frc_raz_ls0_a2` | 1 | LDG ctrl | a2 | Force RAZ. `L311` |
+| `ls0_srcpg_data_a2_q`, `ls0_srcpg_v_a2_q` | 32,1 | Rename | a2 | Source-pg predicate data. `L313-314` |
+| `ls0_iq_ld_uop_vld_d2`, `_d3` | 1,1 | IQ | d2/d3 | IQ-driven uop valid. `L316, L324` |
+| `ls0_ld_gather_d3_q`, `ls0_ld_sve_rep_d3_q`, `ls0_ld_sve_qrep_d3_q` | 1 each | Decode | d3 | SVE mode bits. `L317-319` |
+| `ls0_pld_pli_op_d3` | 1 | Decode | d3 | PLD/PLI op. `L325` |
+| `ls0_iq0_won_arb_a2_q`, `_a4_q` | 1,1 | IQ arb | a2/a4 | IQ arb won. `L326-327` |
+| `ls0_ccpass_a2_q`, `_a3_q`, `_no_abort_a2` | 1,1,1 | CC | a2/a3 | CC-pass flags. `L328-330` |
+| `is_ls_dstx_v_ls0_a2_q`, `_ptag_`, `_vlreg_`, `_size_` | 1, p-tag, 3, 3 | Rename | a2 | Destination-X info. `L332-337` |
+| `is_ls_dsty_v_ls0_a2_q`, `_ptag_`, `_vlreg_` | 1, p-tag, 2 | Rename | a2 | Destination-Y info. `L339-341` |
+| `ls_uop_ctl_ls0_a2_q` | `LS_CTL_LRQ_SAVE` | Decode | a2 | Bundled control bits saved in LRQ entry. `L343` |
+| `ls0_ld_type_ovld_a2_q` | 1 | Decode | a2 | Load-type overload. `L345` |
+| `ls0_va_a2_q`, `ls0_fb_va_a2_q` | VA range | AGU/TLB | a2 | VA + FB-VA. `L347-348` |
+| `ls0_region_va_match_id_v_a2`, `_id_a2` | 1,`VA_REGION_ID_R` | DVM | a2 | VA-region match (for DVM invalidate). `L349-350` |
+| `va_ls0_a1` | [11:4] | AGU | a1 | Byte-in-line bits at a1. `L353` |
+| `ls0_mte_ttbr_a2` | 1 | MTE | a2 | MTE TTBR. `L354` |
+| `tlbid_ls0_a2_q` | `LS_TLBID` | TLB | a2 | TLB entry id. `L356` |
+| `ls0_iq_ld_nc_a2`, `_dev_a2`, `_nc_dev_a2` | 1 each | IQ/attr | a2 | NC / Dev / NC+Dev classification. `L358-360` |
+| `ls0_pc_index_a2_q` | `LPT_PC_INDEX_MAX:0` | LPT | a2 | LPT PC index. `L362` |
+| `ls0_lpt_hit_a2` | 1 | LPT | a2 | LPT hit. `L363` |
+| `ls0_stid_delta_a2_q` | `LPT_STID_DELTA` | LPT | a2 | LPT stid delta. `L364` |
+| `ld_val_ls0_a3` | 1 | a3 | a3 | Load-valid a3. `L366` |
+| `ls0_ld_pa_a3_q`, `ls0_ld_ns_a3_q`, `ls0_ld_ps_at_least_64k_a3_q` | PA range, 1, 1 | TLB | a3 | Physical address + NS + page size. `L368-370` |
+| `ls0_prc_abort_adjusted_a3_q` | 1 | Abort | a3 | Abort flag a3. `L372` |
+| `ld_val_ls0_a4` | 1 | a4 | a4 | Load-valid a4. `L375` |
+| `ls0_older_invalid_st_d2`, `_d4_q` | 1,1 | SB | d2/d4 | Older-invalid store. `L378, L398` |
+| `ls0_ld_false_l2_wkup_d2`, `_d3` | 1,1 | L2 | d2/d3 | False L2 wakeup hints. `L380, L403` |
+| `ls0_ld_fb_fwd_vld_d2_q`, `_d2_qual` | 1,1 | FB | d2 | FB-forward valid / qualified. `L381-382` |
+| `ls0_ld_hit_nc_dev_unal_buf_d2` | 1 | NC/Dev buf | d2 | Hit NC/Dev unalign buffer. `L383` |
+| `ls0_ld_hit_cacheable_unal_buf_d3_q` | 1 | Cacheable buf | d3 | Hit cacheable unalign buffer. `L386` |
+| `ls0_tag_sbecc_err_vld_d3`, `_tag_ecc_sel_d3` | 1,1 | Tag ECC | d3 | Tag SBECC. `L387-388` |
+| `ls0_ld_complete_d4`, `_data_return_d4`, `_l2_poison_d4` | 1 each | d4 | d4 | Load-complete + return + poison. `L390-392` |
+| `ls0_ldar_past_stlr_alloc_rar_d4`, `_d4_override_resolve` | 1,1 | Ordering | d4 | LDAR-past-STLR override. `L393-394` |
+| `ls0_ld_restart_d4` | 1 | d4 | d4 | Load restart. `L395` |
+| `ls0_ld_unalign1_d4_q` | 1 | d4 | d4 | Unalign1 flag d4. `L396` |
+| `ls0_ld_wayt_hit_way_mismatch_d3`, `_ignore_wayt_d3` | 1,1 | Way | d3 | Way-hit mismatch / ignore. `L401-402` |
+| `ls0_ld_false_l2_wkup_sb_mb_overlap_d3` | 1 | L2 | d3 | False-wakeup due to SB/MB overlap. `L405` |
+| `ls0_stlf_cancel_stdata_not_rdy_d3` | 1 | STLF | d3 | STLF cancel — stdata not ready. `L406` |
+| `ls0_ld_l1_miss_sleep_d3`, `_wait_on_fb_d3` | 1,1 | d3 | d3 | Miss-sleep / wait-on-FB. `L407-408` |
+| `ls0_ld_hit_sb_nodata_stid_d3` | `STID_NO_WRAP` | SB | d3 | SB-hit no-data stid. `L411` |
+| `ls0_ld_alloc_match_fb_rst_d3`, `ls0_fb_rst_id_d3`, `ls0_ld_confirm_fb_rst_match_d3` | 1, 6, 1 | FB link | d3 | FB-reset linkage. `L412-414` |
+| **ls1 mirror** | — | — | — | `L417-530` |
+| **ls2 mirror** | — | — | — | `L533-646` |
+
+#### §5.1.8 STDATA wakeup (two ports, p0/p1) and SB/SVE
+
+| Signal | Width | Source | Active stage | Purpose |
+|---|---|---|---|---|
+| `std_wakeup_p0_v`, `std_wakeup_p0_stid` | 1, `STID_NO_WRAP` | STDATA gen | i2 | STDATA wake p0. `L296-297` |
+| `std_wakeup_p1_v`, `std_wakeup_p1_stid` | 1, `STID_NO_WRAP` | STDATA gen | i2 | STDATA wake p1. `L298-299` |
+| `ls0_std_v_i2_q`, `ls1_std_v_i2_q` | 1,1 | SVE std | i2 | STD present (ls0/ls1). `L649, L658` |
+| `std_vec_stid_v_p0_{i2,i3,v1}_q`, `p1_{i2,i3,v1}_q` | 1 each | SVE std | i2/i3/v1 | Vec stid valid per stage. `L651-653, L660-662` |
+| `std_stid_v_p0_e1_q`, `p1_e1_q` | 1 each | SVE std | e1 | Stid valid e1. `L655, L664` |
+| `snp_ecc_self_evict_entry_v_q` | 1 | Snoop | any | Snoop ECC self-evict entry. `L667` |
+| `is_ls_std_data_coming_i1` | 1 | IS | i1 | STD data coming i1. `L669` |
+| `std_overflow_wakeup_all` | 1 | STDATA | any | Wake all on STDATA overflow. `L670` |
+| `sb_empty`, `sb_val_q` | 1, `LS_SB_SIZE` | SB | any | SB empty / entry valids. `L671-672` |
+
+#### §5.1.9 IQ / PLRU / FB hints / d0 arb sidebands
+
+| Signal | Width | Source | Active stage | Purpose |
+|---|---|---|---|---|
+| `iq_oldest_ld_uid_a1_q`, `iq_oldest_ld_vld_a1_q` | `UID`,1 | IQ | a1 | Oldest-load pointer. `L675-676` |
+| `plru_bits_final_dz` | `LS_PLRU_BITS_RANGE` | PLRU | dz | PLRU final bits. `L678` |
+| `fb_fill_way_clean_dz` | `DCACHE_WAY_RANGE` | FB | dz | Fill-way clean mask. `L679` |
+| `evict_rd_req_clean_d0` | 1 | d0 | d0 | Evict-read clean. `L680` |
+| `iq_oldest_ld_uid_i2` | `UID` | IQ | i2 | i2 oldest-load pointer. `L107` |
+
+#### §5.1.10 L2 response capture
+
+| Signal | Width | Source | Active stage | Purpose |
+|---|---|---|---|---|
+| `l2_ls_spec_valid_m2`, `_crit_m2`, `_addr_m2[5:5]`, `_id_m2`, `_qw_en_m2` | 1, 1, 1, `LSL2_DID`, 4 | L2 | m2 | L2 speculative response at m2. `L685-690` |
+| `l2_ls_spec_valid_m4_q`, `_crit_m4_q`, `_id_m4_q`, `l2_ls_rvalid_m4`, `_addr_m4_q[5:5]`, `_addr_m5_q[5:5]` | 1,1, id, 1, 1, 1 | L2 | m4/m5 | L2 response at m4/m5 (registered). `L691-696` |
+
+#### §5.1.11 d0-arb outcome feedback (lrq0/lrq1 outputs feeding back)
+
+| Signal | Width | Source | Active stage | Purpose |
+|---|---|---|---|---|
+| `lrq0_won_arb_ls0_d1`, `lrq0_won_arb_ls1_d1`, `lrq1_won_arb_ls1_d1` | 1 each | d0 arb | d1 | Arb outcomes (which pipe LRQ0/1 won). `L703-705` |
+| `lrq0_ld_unalign1_d1`, `lrq1_ld_unalign1_d1`, `lrq0_ld_unalign2_d1_q`, `lrq1_ld_unalign2_d1_q` | 1 each | d1 | d1 | Unalign1/2 at d1 per LRQ. `L708-712` |
+| `ls{0,1,2}_ld_page_split2_d2` | 1 each | d2 | d2 | Page-split2 at d2. `L714-716` |
+| `lrq0_ld_nc_dev_unalign1_fb_fwd_vld_d1`, `lrq1_…_d1` | 1,1 | d1 | d1 | NC/Dev unalign1 FB-fwd. `L718-719` |
+| `nc_dev_unal_buf_valid_q` | 1 | NC/Dev buf | any | NC/Dev unalign buffer valid. `L721` |
+
+#### §5.1.12 Flush / sync / override
+
+| Signal | Width | Source | Active stage | Purpose |
+|---|---|---|---|---|
+| `flush` | 1 | ct (commit) | any | Flush request (R7-4). `L724` |
+| `flush_uid` | `UID` | ct | any | Flush-UID watermark. `L725` |
+| `mb_atomic_override_lrq0_unalign2_d1` | 1 | MB atomic | d1 | Override LRQ0 unalign2. `L727` |
+| `rst_strex_par_rd_override_lrq1_unalign2_d1` | 1 | STREX | d1 | Override LRQ1 unalign2. `L728` |
+| `sync_mark_buffers_a3` | 1 | Sync | a3 | Sync-mark broadcast. `L731` |
+| `lrq0_ld_false_l2_wkup_d1`, `lrq1_ld_false_l2_wkup_d1` | 1,1 | d1 | d1 | False-wakeup for LRQ0/1. `L738, L743` |
+| `lrq0_ld_uop_flush_d1`, `lrq1_ld_uop_flush_d1` | 1,1 | d1 | d1 | Per-LRQ uop-flush (R7-4). `L741, L746` |
+
+#### §5.1.13 Per-pipe post-alloc pipeline uop-valid / flush / gather
+
+> These feed the FSM flush logic and the post-alloc "did the pipeline
+> actually make it" qualifiers for each entry. The structure is
+> identical across ls0/ls1/ls2 — ls0 only is tabulated.
+
+| Signal | Width | Source | Active stage | Purpose |
+|---|---|---|---|---|
+| `ls0_lrq_ld_uop_vld_d2`, `ls0_ld_uop_vld_d2`/`_d3`/`_d4` | 1 each | LRQ d0 replay / pipe | d2/d3/d4 | Post-alloc uop-valid tracked through d2-d4. `L748-751` |
+| `ls0_ld_unalign2_d2_q`, `_d3_q`, `ls0_ld_unalign1_d3_q` | 1 each | d2/d3 | d2/d3 | Unalign1/2 at d2/d3. `L752-754` |
+| `ls0_ld_match_stdata_in_flight_d3` | 1 | STLF | d3 | Load matches in-flight STDATA. `L756` |
+| `ls0_element_size_d3_q` | 3 | Decode | d3 | Element size. `L759` |
+| `ls0_ld_nc_dev_unalign1_block_fb_credit_d2` | 1 | d2 | d2 | NC/Dev unalign1 blocks FB credit. `L762` |
+| `ls0_uop_flush_d2`/`_d3`/`_d4` | 1 each | Flush | d2-d4 | Per-stage per-pipe flush qualifier. `L763-765` |
+| `ls0_won_pf_train_d4_q` | 1 | PF train | d4 | PF train winner. `L767` |
+| **ls1 mirror** | — | — | — | `L769-788` |
+| **ls2 mirror** | — | — | — | `L790-809` |
+
+#### §5.1.14 DVM / VA-region invalidate + live-lock + misc
+
+| Signal | Width | Source | Active stage | Purpose |
+|---|---|---|---|---|
+| `va_region_clear_v`, `va_region_clear_id` | 1, `VA_REGION_ID_R` | DVM | any | VA-region invalidate (R7-4). `L109-110` |
+| `oldest_ld_replay_cnt_sat` | 1 | Replay ctr | any | Oldest-load replay counter saturated (livelock hint, R7-4). `L1055` |
+
+### §5.2 Output ports
+
+#### §5.2.1 Status / wakeup / oldest-ld
+
+| Signal | Width | Destination | Active stage | Purpose |
+|---|---|---|---|---|
+| `ct_tofu_uid_changed_q` | 1 | ct | any | Tofu-uid changed flag (reg). `L85` |
+| `ls_is_lrq_wakeup_iz` | 1 | IS | iz | LRQ wakeup broadcast to IS scheduler (`LRQ-F13`). `L100` |
+| `tofu_oldest_ld_delay_dvm_sync` | 1 | DVM sync | any | Delay DVM sync until oldest-load resolved. `L101` |
+| `lrq_full` | 1 | Upstream (IQ/IS) | any | LRQ full — back-pressure (`LRQ-F12`, R7-3/4). `L104` |
+| `ct_tofu_uid_q` | `UID` | ct | any | Registered tofu-uid. `L105` |
+| `lrq_has_nc_dev_ld_q` | 1 | Upstream | any | LRQ holds ≥1 NC/Dev load (`LRQ-F11`). `L113` |
+| `ls{0,1,2}_lrq_ld_oldest_in_lrq_d2` | 1 each | d2 | d2 | Per-pipe oldest-in-LRQ marker. `L301, L417, L533` |
+| `blk_non_oldest_ld` | 1 | IS | any | Block non-oldest load issue. `L1057` |
+| `lrq_oldest_uid`, `lrq_oldest_rid`, `lrq_oldest_vld` | `UID`, 1, 1 | IS/Ret | any | Oldest-live LRQ entry. `L1058-1060` |
+| `lrq_oldest_op_clr` | 1 | IS/Ret | any | Oldest-op clear event. `L1061` |
+| `lrq_sync_drained` | 1 | Sync | a3+ | LRQ has drained all sync-marked entries. `L733` |
+
+#### §5.2.2 d0 pipeline re-issue — lrq0/lrq1 request to d0 arb
+
+> 2 "pick" slots drive d0 independently; the set below is for lrq0,
+> mirrored by lrq1.
+
+| Signal | Width | Destination | Active stage | Purpose |
+|---|---|---|---|---|
+| `lrq0_ld_req_v_d0`, `lrq0_ld_req_poss_v_d0`, `lrq0_ld_req_v_late_squash_d0` | 1 each | d0 arb | d0 | Pick slot req valid / possibly-valid / late-squash. `L813-815` |
+| `lrq0_ld_ignore_wayt_d0`, `lrq0_cracked_dev_ld_d0` | 1,1 | d0 | d0 | Way-ignore / cracked-dev flags. `L816-817` |
+| `lrq0_ld_va_d0` | VA range | d0 | d0 | Replay VA. `L818` |
+| `lrq0_ld_dst_size_d0`, `lrq0_ld_elem_size_dw_d0`, `lrq0_ld_size_d0` | 3,1,3 | d0 | d0 | Dst/element/load sizes. `L819, L821, L836` |
+| `lrq0_ld_dstx_v_d0`, `_ptag_d0`, `_vlreg_d0` | 1, p-tag, 3 | d0 | d0 | Dst-X. `L822-824` |
+| `lrq0_ld_gather_v_d0`, `lrq0_ld_type_ovld_d0`, `lrq0_ld_ldg_d0` | 1 each | d0 | d0 | SVE gather / type-ovld / LDG. `L826, L828, L830` |
+| `lrq0_ld_dsty_v_d0`, `_ptag_d0`, `_vlreg_d0` | 1, p-tag, 2 | d0 | d0 | Dst-Y. `L831-833` |
+| `lrq0_ld_unalign_d0`, `lrq0_ld_align_cross_16_byte_d0`, `lrq0_ld_align_cross_32_byte_d0` | 1 each | d0 | d0 | Alignment classes. `L838-840` |
+| `lrq0_ld_matched_fb_rst_d0`, `lrq0_ld_fb_rst_id_d0` | 1, 6 | d0 | d0 | FB-link at replay time. `L842-843` |
+| `lrq0_ld_uid_d0`, `lrq0_ld_rid_d0`, `lrq0_ld_pld_pli_d0` | `UID`, 1, 1 | d0 | d0 | UID / RID / PLD-PLI. `L844-846` |
+| `lrq0_ld_instr_id_d0`, `lrq0_ld_srca_hash_d0`, `lrq0_ld_cache_attr_d0` | 64, 5, `CACHE_ATTR` | d0 | d0 | Opaque ids + cache-attr. `L848, L850-851` |
+| `lrq0_ld_ccpass_d0`, `_ccpass2_d0` | 1,1 | d0 | d0 | CC-pass. `L853-854` |
+| `lrq0_ld_prc_abort_d1`, `lrq0_ld_type_d1`, `lrq0_ld_qw_unalign_d1` | 1, `CTL_TYPE`, 1 | d1 | d1 | Registered at d1. `L855-856, L859` |
+| `lrq0_ld_pa_d1`, `lrq0_ld_ns_d1`, `lrq0_ld_stid_d1`, `lrq0_ld_tlbid_d1` | PA, 1, `STID`, `TLBID` | d1 | d1 | PA + NS + STID + TLBID at d1. `L860-863` |
+| `lrq0_ld_matched_fb_rst_unalign2_d0`, `lrq0_ld_fb_rst_id_unalign2_d0` | 1, 6 | d0 | d0 | Unalign2 FB-link. `L1004-1005` |
+| `lrq0_ld_req_d0_older_than_d1` | 1 | d0 arb | d0 | Age between two d0 slots. `L1006` |
+| **lrq1 mirror** | — | — | — | `L864-1009` |
+
+#### §5.2.3 Per-pipe d2/d3/d4 allocation-side outputs
+
+| Signal | Width | Destination | Active stage | Purpose |
+|---|---|---|---|---|
+| `ls0_lrq_ld_lor_match_vld_d2`, `ls0_lrq_ld_lor_id_d2` | 1, `LOR_ID` | LOR | d2 | LOR match. `L917-918` |
+| `ls0_lrq_ld_share_attr_d2`, `_outer_alloc_d2` | 2,1 | Cache | d2 | Share attr + outer-alloc. `L919-920` |
+| `ls0_lrq_ld_mte_access_d2`, `_mte_prc_mode_d2`, `_mte_ttbr_d2`, `_unpriv_d2`, `_ltag_d2`, `_mte_allow_flt_d2` | 1,1,1,1,4,1 | MTE | d2 | MTE propagation. `L922-928` |
+| `ls0_lrq_lpt_hit_d2` | 1 | LPT | d2 | LPT hit. `L930` |
+| `ls0_lrq_pf_va_region_id_d2`, `_v_d2`, `ls0_lrq_pf_va_d2`, `ls0_lrq_already_trained_d2`, `ls0_lrq_ps_at_least_64k_d2` | `VA_REGION_ID_R`, 1, PF_VA, 1, 1 | PF | d2 | Prefetch-train info. `L932-936` |
+| `ls0_ld_element_size_d2`, `_sign_extend_d2`, `_big_endian_d2` | 3,1,1 | d2 | d2 | Element size / sign-ext / endian. `L938-940` |
+| `ls0_ld_ln_size_d3`, `_pred_v_d3`, `_pred_value_d3` | 2,1,32 | d3 | d3 | Line size / predicate. `L942-944` |
+| `ls0_ld_oldest_no_linked_fb_d2` | 1 | FB link | d2 | Oldest with no linked FB. `L1011` |
+| `ls0_ld_alloc_lrq_entry_spec_a2`, `ls0_ld_alloc_lrq_entry_a2` | 1,1 | Alloc | a2 | Speculative / confirmed alloc grant (`LRQ-F03`). `L1013-1014` |
+| `ls0_sync_mark_d2`, `ls0_lrq_pc_index_d3`, `ls0_lrq_ld_sync_mark_d4` | 1, `PC_INDEX`, 1 | Sync | d2-d4 | Sync-mark outputs. `L1016-1018` |
+| `ls0_ld_sve_vec_force_zero_d3`, `ls0_lpt_hit_wakeup_d3` | 32, 1 | d3 | d3 | SVE zero-force + LPT-hit wakeup. `L321, L323` |
+| `ls0_lrq_ld_pbha_d2` | `PBHA_RANGE` | d2 | d2 | PBHA passthrough. `L171` |
+| **ls1/ls2 mirror** | — | — | — | `L439-973, L555-1002` |
+
+#### §5.2.4 LRQ page-split2 state (registered summary)
+
+| Signal | Width | Destination | Active stage | Purpose |
+|---|---|---|---|---|
+| `lrq_page_split2_pa_q`, `_ns_q`, `_prc_abort_q`, `_ccpass_q` | PA,1,1,1 | d0/d1 | any | Page-split2 "other half" PA+flags. `L1040-1043` |
+| `lrq_page_split2_cache_attr_q`, `_share_attr_q`, `_outer_alloc_q` | `CACHE_ATTR`,2,1 | d1 | any | Attributes. `L1044-1046` |
+| `lrq_page_split2_nc` | 1 | d1 | any | Page-split2 NC. `L1047` |
+| `lrq_page_split2_mte_access_q`, `_mte_allow_flt_q`, `_mte_ttbr_q`, `_pbha_q` | 1,1,1,`PBHA_RANGE` | MTE | any | MTE/PBHA of the other half. `L1049-1053` |
+| `lrq_page_split_nc_c_vld_with_fb` | 1 | FB | any | NC critical split held with FB. `L735` |
+
+#### §5.2.5 FB linkage / dev-load / LOR summary
+
+| Signal | Width | Destination | Active stage | Purpose |
+|---|---|---|---|---|
+| `lrq_dev_load_with_linked_fb_vld` | 1 | FB | any | LRQ has dev-load with linked FB. `L1062` |
+| `lrq_has_ld_with_linked_fb` | 1 | FB | any | LRQ has any FB-linked ld. `L1063` |
+| `lrq_dev_load_with_linked_fb_lor_vld` | `LOR_SIZE` | LOR | any | Per-LOR dev+fb bitmap. `L1065` |
+| `lrq_dev_ldar_non_lor_with_linked_fb_vld`, `lrq_dev_ldlar_with_linked_fb_lor_vld` | 1, `LOR_SIZE` | LOR | any | LDAR/LDLAR variants. `L1068-1069` |
+| `fb_entry_has_linked_nc_dev_ld` | 16 | FB | any | Per-FB-entry NC/Dev-link mask. `L1071` |
+
+#### §5.2.6 LRQ entry-id feedback (pipe → LRQ alloc)
+
+| Signal | Width | Destination | Active stage | Purpose |
+|---|---|---|---|---|
+| `ls{0,1,2}_lrq_id_d2` | 5 each | Pipe | d2 | Allocated LRQ entry-id echoed back to each pipe. `L1075-1077` |
+
+#### §5.2.7 RN-side resolved dev-load summary
+
+| Signal | Width | Destination | Active stage | Purpose |
+|---|---|---|---|---|
+| `ls_rn_rslv_dev_ld_pending_vld` | 1 | RN | any | Any resolved dev-load pending retirement. `L1079` |
+| `ls_rn_oldest_rslv_dev_ld_uid` | `UID_CMP_BITS` | RN | any | Oldest resolved dev-load UID. `L1080` |
+| `ls_rn_oldest_rslv_dev_ld_wrap_uid` | 1 | RN | any | Wrap bit for that UID. `L1082` |
+
+#### §5.2.8 LRQ bulk state exposure (for DFT / debug / assertions)
+
+| Signal | Width | Destination | Active stage | Purpose |
+|---|---|---|---|---|
+| `lrq_vld_q` | `LRQ_RANGE` (16) | DFT | any | Per-entry valid. `L1085` |
+| `lrq_entry{0..15}_state_q` | 4 each | DFT | any | Per-entry FSM state (16 × 4 b). `L1088-1103` |
+| `lrq_empty` | 1 | DFT / IS | any | Queue empty. `L1105` |
+
+> **Port-count summary.** The module header (L35-L1105) declares
+> roughly 460 signals once the ls0/ls1/ls2 triplicates and L2
+> response bundle are counted individually; the 14 input subgroups
+> plus 8 output subgroups above cover every declared signal modulo
+> the explicit "mirror" rows for the ls1/ls2 symmetry. Cycle-stage
+> labels are taken from the suffix (`_a1/_a2/_d2/_d3/_m4/_q`) where
+> present; stages for signals without a stage suffix (e.g. the
+> chicken bits, `flush`, `fb_empty`) are marked `any`.
+
+---
+
+## §6 接口时序 (Interface Timing)
+
+> Per rule R7, a waveform is included for each scenario that meets
+> **at least one** of: cross-cycle handshake, FSM multi-state
+> transition, multi-source concurrent arbitration, exception path.
+> The LRQ is the most FSM-rich module in the pilot, so this section
+> has seven waveforms. Every cycle-level observation below is
+> `UNVERIFIED: inferred from RTL` — the LS cluster is not yet wired
+> into a live simulation in this pilot; all timings are read off the
+> RTL FSM transitions and cross-module handshake structure. The
+> UNVERIFIED flag is marked once per waveform header, not per cycle.
+> Signal names match §5 exactly; where an internal FSM-state variable
+> is referenced (e.g. `lrq_entry{i}_state_q`) it also appears in §5.2.8.
+>
+> **Framing note for §6.2 and §6.6.** The 3-way allocation and the
+> LRQ-full back-pressure both depend on the ordering primitive. In
+> this RTL snapshot, ordering signals used by those paths
+> (`lrq0/lrq1/lrq2_…_a2` allocator picks and cross-pipe age picks)
+> are generated by the **pairwise comparator farm** at
+> `perseus_ls_lrq.sv:L4636-L5038` (48 ×
+> `perseus_ls_age_older_eq_compare` + 3 ×
+> `perseus_ls_age_compare`); the spec-intent `age_matrix(16)` is
+> **not instantiated** in this snapshot. See §1.5 / §3.4 for the
+> full framing. Waveforms below name only the RTL-observed ordering
+> wires.
+
+### §6.1 Entry lifecycle — normal RDY → IN_PIPE → WAIT_L2RESP → L2RESP_M4 → WAIT_FB → RDY
+
+**(UNVERIFIED: inferred from RTL FSM encodings at
+`perseus_ls_defines.sv:L726-L735` + per-entry state reg exposed at
+`perseus_ls_lrq.sv:L1088-L1103`.)**
+
+Scenario: a single load on ls0 misses L1 and allocates LRQ entry 0; L1
+miss goes to L2; L2 returns at m4; entry waits on FB fill, then
+retires.
+
+```
+cycle:               C0    C1    C2    C3    C4    C5    C6    C7    C8
+clk:                _‾_‾_‾_‾_‾_‾_‾_‾_‾_‾_‾_‾_‾_‾_‾_‾_‾_
+ls0_ld_uid_a2_q:    ====< UID_A     >========================================
+ld_val_ls0_a2_q:    ____‾‾‾‾‾‾____________________________________
+ls0_ld_alloc_lrq_entry_a2:  __‾‾‾‾__________________________________    (alloc grant)
+ls0_lrq_id_d2:      ________<=0x0=>______________________________      (entry 0)
+lrq_vld_q[0]:       ____________‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾____
+lrq_entry0_state_q: <RDY ><IN_PIPE><WAIT_L2RESP     ><L2RESP_M4><WAIT_FB><RDY>
+ls0_ld_l1_miss_wait_on_fb_d3: ______________‾‾‾‾____________________
+l2_ls_spec_valid_m4_q:        __________________________‾‾______
+l2_ls_rvalid_m4:              __________________________‾‾______
+l2_ls_spec_id_m4_q:           ________________________<=DID=>____
+fb_available:                 ‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾____
+fb_empty (→ release):         __________________________________‾‾‾‾
+ls_is_lrq_wakeup_iz:          ______________________________‾‾______
+```
+
+Per-cycle walkthrough:
+
+- **C0** ls0 load enters a2 with `ld_val_ls0_a2_q=1`. Allocator grants
+  `ls0_ld_alloc_lrq_entry_a2=1` (§5.2.3, `L1014`). Entry 0 is selected.
+- **C1** (stage d2 of the alloc) `lrq_vld_q[0]` goes high and state
+  enters `IN_PIPE` (`4'b0001`, `defines:L727`). The d0 arb will not
+  re-pick this entry while it is `IN_PIPE` because the pipeline is
+  still driving it.
+- **C2** Pipe reports L1 miss wait-on-FB at d3
+  (`ls0_ld_l1_miss_wait_on_fb_d3=1`, `L408`). State transitions to
+  `WAIT_L2RESP` (`4'b0010`, `defines:L728`).
+- **C3-C4** Entry idles in `WAIT_L2RESP`, periodically consulting
+  `ls_lrq_timeout_tick_tock_change_q` (`L65`) for timeout (disabled
+  here by `ls_disable_lrq_wait_l2resp_timeout=0`).
+- **C5** L2 drives speculative response bundle at m2/m4; the registered
+  `l2_ls_spec_valid_m4_q=1` and `l2_ls_rvalid_m4=1` at m4 (`L691,
+  L694`) match the entry's captured DID. State moves to `L2RESP_M4`
+  (`4'b0110`, `defines:L733`).
+- **C6** Entry transitions to `WAIT_FB` (`4'b1001`, `defines:L735`) —
+  data is announced but FB fill has not yet drained to the cache
+  array. `ls_is_lrq_wakeup_iz` pulses at iz to wake dependent ops
+  (`LRQ-F13`, `L100`).
+- **C7** FB completes fill (`fb_fill_wb_mem_m4`, `L698`); FSM returns
+  to `RDY` (`4'b0000`). `lrq_vld_q[0]` deasserts next cycle.
+
+RTL pin cites: `L1014` (alloc), `L1077` (entry-id echo to ls0),
+`L1088-L1103` (per-entry state exposed), `L691-L696` (L2 response),
+`L1105` (empty).
+
+### §6.2 3-way concurrent allocation (ls0 / ls1 / ls2 all alloc in one cycle)
+
+**(UNVERIFIED: inferred from pairwise comparator farm at
+`perseus_ls_lrq.sv:L4636-L5038` and allocator pick logic at
+`L4068-L4080`; no simulation data.)**
+
+> Ordering-signal framing: the three `ls{0,1,2}_uop_older_than_…_a1_q`
+> inputs (§5.1.3, `L69-L71`) plus the 48+3 pairwise-comparator farm
+> drive which of the three pipes gets which of the three free LRQ
+> entries. The spec-intent `age_matrix(16)` is **not instantiated** in
+> this RTL snapshot — see §3.4. The waveform labels only the
+> RTL-observed wires.
+
+Pre-condition: three entries free (say 5, 6, 7); three loads on
+ls0/ls1/ls2 all valid at a2 with all `_block_lrq_alloc_a2_q = 0` and
+no MTE/abort/overlap blocking.
+
+```
+cycle:                                C0        C1        C2
+clk:                                 _‾_‾_‾_‾_‾_‾_‾_‾_
+ld_val_ls0_a2_q / ls1 / ls2:         ‾‾‾‾‾‾‾‾  ________  ________
+ls0_uop_older_than_ls1_a1_q:         ‾‾‾‾‾‾‾‾  ________  ________
+ls1_uop_older_than_ls2_a1_q:         ‾‾‾‾‾‾‾‾  ________  ________
+ls0_uop_older_than_ls2_a1_q:         ‾‾‾‾‾‾‾‾  ________  ________
+lrq_more_than_two_avail (internal):  ‾‾‾‾‾‾‾‾  ________  ________
+ls0_ld_alloc_lrq_entry_a2:           ‾‾‾‾‾‾‾‾  ________  ________
+ls1_ld_alloc_lrq_entry_a2:           ‾‾‾‾‾‾‾‾  ________  ________
+ls2_ld_alloc_lrq_entry_a2:           ‾‾‾‾‾‾‾‾  ________  ________
+ls0_lrq_id_d2:                       ________  <=5=>     ________
+ls1_lrq_id_d2:                       ________  <=6=>     ________
+ls2_lrq_id_d2:                       ________  <=7=>     ________
+lrq_vld_q[7:5]:                      ________  ‾‾‾‾‾‾‾‾  ‾‾‾‾‾‾‾‾
+lrq_entry{5,6,7}_state_q:            <RDY>     <IN_PIPE> <IN_PIPE>
+```
+
+Per-cycle walkthrough:
+
+- **C0 (a2)** All three `ld_val_ls{0,1,2}_a2_q=1`. The pairwise
+  comparator farm (`L4636-L5012`) produces 48 older-than bits (3
+  allocators × 16 entries). Three "can-alloc" vectors
+  `lrq_{can,two_can,three_can}_alloc_a2` (computed around `L4068`) are
+  all satisfied because `lrq_more_than_two_avail` is high. All three
+  `ls{0,1,2}_ld_alloc_lrq_entry_a2` grants fire in the same cycle
+  (`L1013-1014, L1022-1023, L1031-1032`).
+- **C1 (d2)** Entry ids are echoed back to each pipe via
+  `ls{0,1,2}_lrq_id_d2` (`L1075-L1077`). `lrq_vld_q` bits [7:5] rise
+  simultaneously. The three entries enter `IN_PIPE` in the same cycle.
+  Cross-allocator age is captured by the 3 × `perseus_ls_age_compare`
+  cells at `L5026-L5038` so that the "older-than" relation between the
+  three newly-allocated entries is consistent with ls0 < ls1 < ls2.
+- **C2** Pipes continue into d3 normally; each entry independently
+  chooses its next state (WAIT_L2RESP vs WAIT_STDATA vs …) based on
+  its own pipe outcome.
+
+Consistency invariant: for the three newly-allocated entries
+{5,6,7}, the pairwise "older-than" bits produced by the comparator
+farm must satisfy ls0 < ls1 < ls2 (from the input
+`ls{i}_uop_older_than_ls{j}_a1_q` triple). The spec-intent
+`age_matrix(16)` would have encoded this in one matrix update; here it
+is encoded by 3 pairwise writes into the farm's state. Functional
+equivalence is discussed in §8 (Gate 15).
+
+### §6.3 STDATA speculative wakeup — WAIT_STDATA → STDATA_SPEC_WKUP → RDY
+
+**(UNVERIFIED: inferred from state encodings at `defines:L729-L730`
+and STDATA wakeup ports at `L296-L299`, `L669-L670`.)**
+
+Scenario: a load that depends on in-flight store data (`STLF` path)
+allocates and sits in `WAIT_STDATA`; store-data broadcast fires on
+port p0; entry speculatively wakes and retires.
+
+```
+cycle:                     C0      C1      C2      C3      C4      C5
+clk:                      _‾_‾_‾_‾_‾_‾_‾_
+lrq_entry3_state_q:       <IN_PIPE><WAIT_STDATA       ><STDATA_SPEC_WKUP><RDY>
+ls0_stid_a2_q:            <=STID_X=>_________________________________________
+ls0_ld_match_stdata_in_flight_d3: __‾‾‾‾__________________________________
+std_wakeup_p0_v:          ____________________________‾‾________
+std_wakeup_p0_stid:       ____________________________<=STID_X=>___
+is_ls_std_data_coming_i1: ______________________________‾‾__________
+ls_is_lrq_wakeup_iz:      ____________________________________‾‾____
+ls_disable_precise_stdata_wakeup: ________________________________________
+```
+
+Per-cycle walkthrough:
+
+- **C0** Entry 3 is `IN_PIPE`; `ls0_ld_match_stdata_in_flight_d3`
+  (`L756`) asserts at d3 — load matches an in-flight STDATA.
+- **C1** State transitions to `WAIT_STDATA` (`4'b0011`,
+  `defines:L729`). Entry is blocked from d0 re-pick.
+- **C2-C3** Entry sits in `WAIT_STDATA`.
+- **C4** `std_wakeup_p0_v=1` with `std_wakeup_p0_stid` equal to the
+  entry's captured `stid` (`L296-L297`). With
+  `ls_disable_precise_stdata_wakeup=0`, the entry moves to
+  `STDATA_SPEC_WKUP` (`4'b0111`, `defines:L730`) — a **speculative**
+  state (the FB may still back-pressure).
+- **C5** `ls_is_lrq_wakeup_iz` (`L100`) pulses to wake IS dependents;
+  entry transitions to `RDY`.
+
+Corner case: if `ls_disable_precise_stdata_wakeup=1` or
+`std_overflow_wakeup_all=1` (`L670`), the wakeup fires broadly rather
+than on a stid match; the FSM still passes through
+`STDATA_SPEC_WKUP` but the qualifier set is wider.
+
+### §6.4 `ct_flush` mid-lifecycle — all pending entries flushed
+
+**(UNVERIFIED: inferred from `flush` / `flush_uid` port at `L724-L725`
+and per-entry kill path consumers.)**
+
+Scenario: two entries live in different states when a commit-side
+flush arrives. All entries younger than `flush_uid` are killed in one
+cycle; oldest entries older than the watermark survive.
+
+```
+cycle:                     C0      C1      C2      C3
+clk:                      _‾_‾_‾_‾_‾_‾_
+flush:                    ______‾‾__________
+flush_uid:                ______<=UID_W>______
+lrq_entry2_state_q:       <WAIT_L2RESP><WAIT_L2RESP><WAIT_L2RESP>   (UID older than UID_W — kept)
+lrq_entry4_state_q:       <WAIT_STDATA><WAIT_STDATA><RDY         >   (UID younger than UID_W — killed)
+lrq_entry9_state_q:       <IN_PIPE    ><IN_PIPE    ><RDY         >   (killed)
+lrq_vld_q[2]:             ‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾
+lrq_vld_q[4]:             ‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾______
+lrq_vld_q[9]:             ‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾______
+lrq_full:                 ________________________
+ls_is_lrq_wakeup_iz:      ________________________
+```
+
+Per-cycle walkthrough:
+
+- **C0** System operating normally; three entries live (2, 4, 9).
+- **C1** Commit asserts `flush=1` with `flush_uid=UID_W` (`L724-L725`).
+  Every entry's per-entry FSM compares its stored UID to `flush_uid`:
+  entries younger than the watermark (4, 9) take the kill arc
+  directly to `RDY`. Entry 2 is older — it survives and stays in
+  `WAIT_L2RESP`.
+- **C2** `lrq_vld_q[4]` / `lrq_vld_q[9]` deassert; the kill arc does
+  not pulse `ls_is_lrq_wakeup_iz` (there is no wakeup — the loads are
+  being thrown away, not completed).
+- **C3** Entry 2 continues waiting for its L2 response as before.
+
+Corner cases: `lrq0_ld_uop_flush_d1` / `lrq1_ld_uop_flush_d1`
+(`L741, L746`) are the per-LRQ in-pipe flush qualifiers used when a
+pipe-local flush lands on an entry that is currently being replayed at
+d0-d1; that path converges with the commit `flush` at the state's
+kill input.
+
+### §6.5 Livelock detection → buster trigger
+
+**(UNVERIFIED: inferred from `ls_lrq_timeout_tick_tock_change_q`
+input at `L65`, `trigger_mid_range_livelock_buster` at `L90`,
+`oldest_ld_replay_cnt_sat` at `L1055`, and `blk_non_oldest_ld` output
+at `L1057`.)**
+
+Scenario: the oldest LRQ entry is repeatedly replayed without making
+progress. Replay counter saturates; the livelock-buster asserts;
+non-oldest loads are blocked to let the oldest succeed.
+
+```
+cycle:                               C0     C1     C2     C3     C4
+clk:                                _‾_‾_‾_‾_‾_‾_‾_‾_‾_
+ls_tick_tock_q:                     _____‾‾‾‾‾_____‾‾‾‾‾_____
+ls_lrq_timeout_tick_tock_change_q:  _________‾‾____________________
+oldest_ld_replay_cnt_sat:           ____________‾‾‾‾‾‾‾‾‾‾‾‾____
+trigger_mid_range_livelock_buster:  ________________‾‾‾‾‾‾‾‾____
+blk_non_oldest_ld:                  ________________‾‾‾‾‾‾‾‾‾‾‾‾
+lrq_oldest_uid:                     <UID_O  >  <UID_O  >  <UID_O  >
+lrq_oldest_vld:                     ‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾
+lrq_entry0_state_q:                 <IN_PIPE ><IN_PIPE ><IN_PIPE ><L2RESP_M4><RDY>
+```
+
+Per-cycle walkthrough:
+
+- **C0-C1** `ls_tick_tock_q` toggles (`L66`); oldest entry 0 keeps
+  being re-picked by d0 arb but is bounced (e.g. by
+  `ls0_ld_l1_miss_wait_on_fb_d3` without progress).
+- **C2** Tick-tock change detected without oldest-load retirement —
+  `ls_lrq_timeout_tick_tock_change_q` pulses (`L65`).
+- **C3** Replay-counter saturates: `oldest_ld_replay_cnt_sat=1`
+  (`L1055`). The LRQ asserts `blk_non_oldest_ld=1` (`L1057`) and
+  receives `trigger_mid_range_livelock_buster=1` (`L90`) from the
+  upstream livelock detector. With non-oldest loads now blocked the
+  oldest entry finally gets the needed resource.
+- **C4** Oldest completes (`L2RESP_M4` → `RDY`); the replay-counter
+  resets next cycle; `blk_non_oldest_ld` drops.
+
+Note: the entire livelock scheme relies on the tick-tock counter as a
+progress witness; `ls_disable_lrq_wait_l2resp_timeout=0` must hold for
+the timeout branch to fire (`L45`). This waveform is the "live-lock
+buster" path, not the pure L2-response timeout path.
+
+### §6.6 LRQ full → back-pressure on allocation
+
+**(UNVERIFIED: inferred from `lrq_full=&lrq_vld_qual` at
+`perseus_ls_lrq.sv:L7478` and allocator can-alloc logic at
+`L4068-L4080`.)**
+
+> Ordering-signal framing: the "who wins the last free slot" pick
+> when only 1 entry is free is produced by the same pairwise
+> comparator farm at `perseus_ls_lrq.sv:L4636-L5038` as §6.2; the
+> spec-intent `age_matrix(16)` is not instantiated in this RTL
+> snapshot.
+
+Scenario: 15 entries live, one free slot; three pipes present valid
+loads. Only one gets an LRQ id; the other two are back-pressured; then
+an entry retires and `lrq_full` drops.
+
+```
+cycle:                     C0      C1      C2      C3      C4
+clk:                      _‾_‾_‾_‾_‾_‾_‾_‾_
+lrq_vld_q (popcount):     15       15      16      16      15
+lrq_full:                 ________________‾‾‾‾‾‾‾‾‾‾‾‾____
+ld_val_ls{0,1,2}_a2_q:    ‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾
+ls0_ld_alloc_lrq_entry_a2:________‾‾‾‾____________________    (oldest of three wins)
+ls1_ld_alloc_lrq_entry_a2:________________________________    (back-pressured)
+ls2_ld_alloc_lrq_entry_a2:________________________________    (back-pressured)
+block_ls_1 / block_ls_2:  ________‾‾‾‾‾‾‾‾‾‾‾‾________        (upstream re-issue block)
+lrq_entry6_state_q:       <WAIT_L2RESP><L2RESP_M4><WAIT_FB><RDY>
+lrq_vld_q[6]:             ‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾______
+```
+
+Per-cycle walkthrough:
+
+- **C0** 15 entries live, 1 free. `lrq_full=0` (not all bits set).
+- **C1** Three loads valid at a2. The pairwise comparator farm
+  selects the oldest — say ls0 — which gets the last free entry. Its
+  `ls0_ld_alloc_lrq_entry_a2=1` fires. `ls1`/`ls2` grants stay low
+  because the can-alloc logic at `L4068-L4080` evaluates
+  `lrq_more_than_one_avail = 0`. Upstream sees `block_ls_1` and
+  `block_ls_2` drive high to re-issue them next cycle (`L74-L75`).
+- **C2** `lrq_vld_q` is all-16; `lrq_full=&lrq_vld_qual` (`L7478`)
+  goes high. No alloc grants can fire on any pipe regardless of valid
+  state.
+- **C3** Entry 6 transitions `L2RESP_M4 → WAIT_FB → RDY`.
+- **C4** `lrq_vld_q[6]` deasserts; `lrq_full` drops; ls1/ls2 (whose
+  upstream re-issue is still live) can now alloc in a later cycle.
+
+Interaction with §6.2: the same 48+3 pairwise comparator farm that
+picks the *winners* in a 3-way concurrent alloc is reused here to
+pick the *single* allocator when only one slot is free.
+
+### §6.7 DVM / `va_region_clear` invalidate
+
+**(UNVERIFIED: inferred from `va_region_clear_v/id` at `L109-L110`,
+per-entry VA-region match inputs at `L349-L350`, and
+`tofu_oldest_ld_delay_dvm_sync` at `L101`.)**
+
+Scenario: a DVM TLBI broadcast arrives carrying a VA-region id; every
+LRQ entry whose captured region-id matches is invalidated and
+re-enters `RDY`; oldest loads that cannot be simply dropped delay the
+DVM sync handshake.
+
+```
+cycle:                           C0      C1      C2      C3      C4
+clk:                            _‾_‾_‾_‾_‾_‾_‾_‾_
+va_region_clear_v:              ____‾‾__________________________
+va_region_clear_id:             ____<=RID>_______________________
+lrq_entry1_state_q:             <WAIT_STDATA><WAIT_STDATA><RDY>   (region matches → killed)
+lrq_entry5_state_q:             <WAIT_L2RESP><WAIT_L2RESP><L2RESP_M4><WAIT_FB><RDY>  (no match → kept)
+lrq_entry8_state_q:             <IN_PIPE    ><IN_PIPE    ><RDY>   (region matches → killed)
+lrq_vld_q[1]:                   ‾‾‾‾‾‾‾‾____________________
+lrq_vld_q[5]:                   ‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾____
+lrq_vld_q[8]:                   ‾‾‾‾‾‾‾‾____________________
+tofu_oldest_ld_delay_dvm_sync:  ____‾‾‾‾‾‾‾‾________________   (entry5 is oldest — delay DVM sync)
+ls_is_lrq_wakeup_iz:            ________________________________
+```
+
+Per-cycle walkthrough:
+
+- **C0** Three entries live in various states. DVM subsystem asserts
+  `va_region_clear_v=1` with `va_region_clear_id=RID` (`L109-L110`).
+  Each entry captured its own `ls{i}_region_va_match_id_v_a2` and
+  `_id_a2` at alloc (`L349-L350` for ls0 mirrored for ls1/ls2); the
+  per-entry match compares stored id vs broadcast id.
+- **C1** Entries 1 and 8 match — their FSMs take the region-clear
+  kill arc to `RDY`. Entry 5 does not match and stays in
+  `WAIT_L2RESP`.
+- **C2** The kill transitions complete. Because entry 5 (the oldest
+  load) was not killed and is still outstanding, the LRQ asserts
+  `tofu_oldest_ld_delay_dvm_sync=1` (`L101`) so the DVM handshake
+  upstream waits for the oldest-load to finish before acknowledging
+  the TLBI.
+- **C3-C4** Entry 5 eventually gets its L2 response and retires;
+  `tofu_oldest_ld_delay_dvm_sync` drops; DVM sync completes.
+
+Note: the kill arc does **not** pulse `ls_is_lrq_wakeup_iz` — the
+invalidated loads are re-issued by the scheduler when re-fetched
+after the TLBI, not woken in place.
+
+---
+
+<!-- §7 onwards deferred to Tasks 15-18 (Gates 14-17). Do not fill here. -->
