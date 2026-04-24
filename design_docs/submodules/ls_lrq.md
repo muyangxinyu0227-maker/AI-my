@@ -1236,4 +1236,1051 @@ after the TLBI, not woken in place.
 
 ---
 
-<!-- §7 onwards deferred to Tasks 15-18 (Gates 14-17). Do not fill here. -->
+<!-- §9 onwards deferred to Tasks 16-18 (Gates 15-17). Do not fill here. -->
+
+## §7 时钟复位 (Clock & Reset)
+
+> Scope per Gate 14 plan: the top-level functional clock `clk`, the
+> async active-high `reset_i`, the LRQ single request-conditional
+> clock-gate (RCG) domain `clk_lrq_entry` that fans out to all 16
+> `ls_lrq_entry` children, and the two reset patterns used inside
+> `perseus_ls_lrq.sv`. Per-entry FSM reset details (the precise set of
+> state flops inside `ls_lrq_entry` that clear to `RDY`) are the
+> concern of Gate 16 (§10 of this doc) and are only sketched here.
+> Every assertion below cites an RTL line.
+
+### §7.1 Clock tree (two domains visible inside `ls_lrq`)
+
+| Clock | Source | Gating predicate | Gated-flop population | RTL witness |
+|-------|--------|------------------|------------------------|-------------|
+| `clk` | top-level LSU clock (module port `L30`) | none (free-running inside the module) | every `always_ff @(posedge clk …)` — the 196 always blocks outside the per-entry generate include the ~170 non-entry state flops: `lrq_has_nc_dev_ld_q`, `l2_ls_spec_*_m3_q`, `ls_is_lrq_wakeup_iz`, `disable_lrqN_pick_pre_q`, `ls0/1/2_ld_fast_byp_lrqN_a3_q`, the 16-deep `older_than_entryN_q` per-entry bit-vector, etc. | e.g. `L3784`, `L3852`, `L4034`, `L4274`, `L25086` |
+| `clk_lrq_entry` | ICG `u_clk_lrq` (`perseus_cell_clkgate`) at `L25101-L25106` | `lrq_entry_rcg_en = chka_disable_ls_rcg \| (\|lrq_vld_qual) \| lrq_alloc_possible_a1 \| lrq_alloc_possible_a2` (`L25080-L25083`) then registered one cycle through `lrq_entry_rcg_en_q` (`L25086-L25098`) | **all 16 `ls_lrq_entry` instance clocks** — `lrq_entry_clk[0..15]`, fed from `clk_lrq_entry` at `L25110-L25125` | gate instance `L25101-L25106`; entry-clock fanout `L25110-L25125` |
+
+**Clock-gate reference block (full quote).**
+
+```systemverilog
+// file:perseus_ls_lrq.sv:L25080-L25106
+  assign lrq_entry_rcg_en  = chka_disable_ls_rcg |
+                          (|lrq_vld_qual[`PERSEUS_LS_LRQ_RANGE]) |
+                          (lrq_alloc_possible_a1 | lrq_alloc_possible_a2)  ;
+
+
+  always_ff @(posedge clk or posedge reset_i)
+  begin: u_lrq_entry_rcg_en_q
+    if (reset_i == 1'b1)
+      lrq_entry_rcg_en_q <= `PERSEUS_DFF_DELAY {1{1'b0}};
+`ifdef PERSEUS_XPROP_FLOP
+    else if (reset_i == 1'b0)
+      lrq_entry_rcg_en_q <= `PERSEUS_DFF_DELAY lrq_entry_rcg_en;
+    else
+      lrq_entry_rcg_en_q <= `PERSEUS_DFF_DELAY {1{1'bx}};
+`else
+    else
+      lrq_entry_rcg_en_q <= `PERSEUS_DFF_DELAY lrq_entry_rcg_en;
+`endif
+  end
+
+
+ perseus_cell_clkgate u_clk_lrq (
+        .dftcgen          (cb_dftcgen),
+        .clk         (clk),
+        .enable_i  (lrq_entry_rcg_en_q),
+        .clk_gated   (clk_lrq_entry)
+ );
+```
+
+- **What.** A single ICG gates the clock to *all 16* LRQ entries
+  uniformly. The gate opens only when (a) at least one entry is
+  already occupied (`|lrq_vld_qual`), or (b) an alloc candidate exists
+  in pipe a1 or a2 (`lrq_alloc_possible_a1/a2` — set if any of
+  `issue_v_lsN_ld_aX_q` is asserted — defined at the top of the
+  `lrq_alloc_possible_*` assignments around `L25070-L25077`), or
+  (c) the global RCG-disable chicken bit is asserted.
+- **How.** The raw enable is first registered through
+  `lrq_entry_rcg_en_q` (`L25086-L25098`). The registered enable is
+  then handed to `perseus_cell_clkgate u_clk_lrq` (standard latch-AND
+  ICG) together with `clk` and `cb_dftcgen`. `clk_lrq_entry` fans out
+  to all 16 `lrq_entry_clk[n]` nets (`L25110-L25125`), which in turn
+  become the `clk` port of every `perseus_ls_lrq_entry` instance.
+- **Why.** An empty, idle LRQ with no pending alloc is the
+  clock-power common case between load bursts; gating all 16 entries
+  at once saves the entire per-entry flop power budget in that state.
+  A single RCG (vs one per entry) is correct because the entry-array
+  is indexed — reads are combinational off `_q`, so any individual
+  entry's stored state is unaffected by the collective gate, and the
+  alloc-write cycles necessarily assert `lrq_alloc_possible_aN` one
+  cycle ahead (the pipelined `_en_q` register matches the write
+  latency). Compared to per-entry ICGs this saves 15 clock-gates and
+  avoids the staircase-of-gates timing risk on the entry-clock skew.
+- **Contrast with `ls_tlb`.** `ls_tlb` splits its functional flops
+  across *four* ICGs (three per-pipe `clk_a2_flops_lsN_a1` +
+  `clk_tlb_flops`) because the TLB has distinct per-pipe-stage and
+  per-entry write populations. LRQ has no per-pipe entry writes (all
+  allocs write into the same indexed entry array) and therefore needs
+  only one gate.
+
+### §7.2 Reset strategy
+
+`ls_lrq` uses **async-assert / sync-deassert active-high reset**
+uniformly, consistent with ARM-N2 RTL conventions. The reset input is
+module port `reset_i` (`L37`). There is no power-on-reset `poreset`
+port declared on this module (search for `poreset` in ports returns
+zero hits) — the top-level LSU's power-on sequence is expressed
+through `reset_i` held high for the required cycle count, as is
+standard for this RTL family.
+
+Two flop patterns coexist:
+
+**Pattern A — async-reset flops (control state must be deterministic
+after reset).**
+```systemverilog
+// file:perseus_ls_lrq.sv:L3784-L3797 (representative: first always_ff in the module body)
+  always_ff @(posedge clk or posedge reset_i)
+  begin: u_disable_lrq1_pick_pre_q
+    if (reset_i == 1'b1)
+      disable_lrq1_pick_pre_q <= `PERSEUS_DFF_DELAY {1{1'b0}};
+`ifdef PERSEUS_XPROP_FLOP
+    else if (reset_i == 1'b0)
+      disable_lrq1_pick_pre_q <= `PERSEUS_DFF_DELAY disable_lrq1_pick_nxt;
+    else
+      disable_lrq1_pick_pre_q <= `PERSEUS_DFF_DELAY {1{1'bx}};
+`else
+    else
+      disable_lrq1_pick_pre_q <= `PERSEUS_DFF_DELAY disable_lrq1_pick_nxt;
+`endif
+  end
+```
+Pattern A is the dominant pattern in `ls_lrq`: `disable_lrqN_pick_pre_q`
+(`L3784`, `L3800`), `l2_ls_spec_valid_m3_q` (`L3830`),
+`ls_is_lrq_wakeup_iz` (`L3852`), `lrq_has_nc_dev_ld_q` (`L4034`),
+`lrq_has_nc_dev_ld_above_threshold_q` (`L4274`),
+`lrq_page_split_nc_c_vld_with_fb` (`L24242`), `lrq_entry_rcg_en_q`
+(`L25086`). All such flops clear to zero on reset so the module comes
+up in a "no entries valid, no broadcasts, no back-pressure" state.
+
+**Pattern B — no-reset data flops (value undefined after reset, but
+gated by a separately-reset valid bit).**
+```systemverilog
+// file:perseus_ls_lrq.sv:L3821-L3825 (representative: ls_enable_serialize_gather_q)
+  always_ff @(posedge clk)
+  begin: u_ls_enable_serialize_gather_q
+    ls_enable_serialize_gather_q <= `PERSEUS_DFF_DELAY ls_enable_serialize_gather;
+  end
+```
+Pattern B applies to data-path shadow flops that are always refreshed
+combinationally one cycle later and whose X-propagation out of reset
+is already masked by a Pattern-A valid upstream — representative
+examples are the `l2_ls_spec_*_m3_q` payload group (`L3869`,
+`L3883`) qualified by the Pattern-A `l2_ls_spec_valid_m3_q`, and the
+numerous `lsN_ld_fast_byp_lrqN_a3_q` payload flops (`L7667` family)
+qualified by Pattern-A `lsN_ld_fast_byp_lrqN_a3_q_vld` upstream.
+
+**Per-entry FSM reset.** The 16 LRQ entries are instantiated via
+`perseus_ls_lrq_entry u_lrq_entry_N` from `L13583` (entry 0) through
+`L21565` (entry 15, approximate). Each instance receives `clk`
+= `lrq_entry_clk[n]` and `reset_i` = the shared `reset_i`. The
+per-entry state machine clears to the `RDY` state on reset — this is
+enforced *inside* `ls_lrq_entry`, not in `ls_lrq.sv`, and its
+detailed RTL walkthrough belongs to Gate 16 (§10). From
+`ls_lrq.sv`'s vantage the post-reset invariant is:
+
+- `lrq_vld_q[`PERSEUS_LS_LRQ_RANGE] == 16'b0` (all entries invalid),
+  observable via `lrq_vld_qual` which feeds `lrq_entry_rcg_en` and
+  `lrq_full` (`L7478`: `lrq_full = &lrq_vld_qual`).
+- `ls_is_lrq_wakeup_iz = 1'b0` (no wake-up broadcast in flight,
+  `L3854`).
+- `lrq_has_nc_dev_ld_q = 1'b0` (no NC/device load in the queue,
+  `L4036`).
+- `disable_lrq0/1_pick_pre_q = 1'b0` (LRQ can arbitrate for the
+  re-issue d0 slot, `L3786`, `L3802`).
+
+These invariants together mean that after reset the module is in a
+quiescent state where `lrq_entry_rcg_en = chka_disable_ls_rcg` (both
+`lrq_vld_qual` and `lrq_alloc_possible_a1/a2` are zero), so the
+entry-clock is gated off until the first alloc-capable issue reaches
+a1.
+
+### §7.3 Ordering-state reset — spec-intent vs RTL snapshot
+
+Chapter §6 and the shared primitive `[ls_age_matrix](../shared_primitives/ls_age_matrix.md)` (instantiated
+conceptually as `age_matrix(N=16)`) describe LRQ age-ordering as a
+16×16 antisymmetric bit matrix whose "oldest entry" is a row that is
+all-zero AND whose column is all-one. The matrix model makes "reset
+to all-zero" a meaningful statement about the ordering state.
+
+The RTL does **not** realise this as a monolithic `age_matrix_q`
+array; instead, as §6.2 already documented, each LRQ entry owns a
+16-bit vector `older_than_entryN_q[15:0]` whose update is driven by:
+
+- **48 instantiations of `perseus_ls_age_older_eq_compare`** at
+  `L4636-L5012` — one pairwise compare per `(entry_i, lsN_alloc)`
+  for `entry_i ∈ 0..15` and `lsN ∈ {ls0, ls1, ls2}`. These are
+  **purely combinational** — each instance has `uid_a`, `uid_b`,
+  and output `a_equal_older_than_b`.
+- **3 instantiations of `perseus_ls_age_compare`** at
+  `L5026-L5038` — pairwise `ls1_alloc_older_than_ls0`,
+  `ls1_alloc_older_than_ls2`, `ls2_alloc_older_than_ls0`. Also
+  combinational.
+- Plus the **per-entry bit flops** `older_than_entryN_q[k]` — these
+  *are* the sequential ordering state. They are inside
+  `ls_lrq_entry` (Gate 16 detail).
+
+| Layer | Reset semantics in spec-intent (`age_matrix(16)`) | Reset semantics in RTL snapshot |
+|---|---|---|
+| Pairwise comparator farm (48+3) | Not a state — the matrix model has no comparator instance concept | 51 **combinational** cells; **nothing to reset** (no state) |
+| Per-entry ordering vector | Matrix rows = initial all-zero after reset; derived from "no entries valid" | `older_than_entryN_q[15:0]` flops reside in `ls_lrq_entry` (Gate 16); on reset `lrq_vld_q[n]=0` so their contents are **don't-care** |
+| Effective oldest signal `lrq_entry_oldest[15:0]` (`L3193`) | Derived from matrix-row-all-zero AND column-all-one | Combinational derivation from `older_than_entryN_q & lrq_vld_q` — with `lrq_vld_q=0` after reset, `lrq_entry_oldest=16'b0` ⇒ `lrq_overall_oldest_vld=0` (`L22924`). No explicit reset needed. |
+
+**Key insight.** Because the ordering state is keyed off `lrq_vld_q`
+(`L22876-L22892` gates every per-entry `uid` and `rid` select by
+`lrq_entry_oldest`, which in turn is masked by valid), the
+ordering-state "reset" is *implicit*: as long as `lrq_vld_q` is
+cleared to zero, any residual garbage in `older_than_entryN_q` is
+ignored by every downstream consumer. This matches the
+shared-primitive `[ls_age_matrix §4.2](../shared_primitives/ls_age_matrix.md)` observation that
+the caller contract is "valid-qualified reads only"; LRQ satisfies
+that contract by construction.
+
+### §7.4 DFT path
+
+`cb_dftcgen` (`L34` port, `L25104` consumer) and `cb_dftramhold`
+(`L34` port) are declared at the module boundary. `cb_dftcgen` is
+wired into `u_clk_lrq`'s `.dftcgen` pin (`L25104`) so that during
+scan the clock gate is held transparent (`clk_gated=clk`), making
+all LRQ entry flops observable. `cb_dftramhold` has no functional
+`always` references inside `perseus_ls_lrq.sv` itself — identical
+to the `ls_tlb` pattern documented in Gate 9 §7.3, the signal is
+consumed inside downstream RAM-surrogate primitives. `(UNVERIFIED:
+inferred from zero grep hits for cb_dftramhold outside the port
+declaration; exact consumer is in `ls_lrq_entry` or further
+downstream, to be confirmed in Gate 16 / Gate 17.)`
+
+### §7.5 Summary — reset matrix
+
+| Element | Clock | Reset | Update enable |
+|---|---|---|---|
+| `disable_lrq0/1_pick_pre_q` (`L3784`, `L3800`) | `clk` | async `reset_i → 1'b0` | always enabled (free-running combinational input) |
+| `l2_ls_spec_valid_m3_q` (`L3830`) | `clk` | async `reset_i → 1'b0` | always enabled |
+| `ls_is_lrq_wakeup_iz` (`L3852`) | `clk` | async `reset_i → 1'b0` | always enabled — input is `ls_is_lrq_wakeup_iz_din` computed at `L3846` |
+| `lrq_has_nc_dev_ld_q` (`L4034`) | `clk` | async `reset_i → 1'b0` | `favor_iq1_en` qualifier (`L4039`) |
+| `lrq_has_nc_dev_ld_above_threshold_q` (`L4274`) | `clk` | async `reset_i → 1'b0` | `ld_can_alloc_when_nc_dev_in_lrq_en` qualifier (`L4279`) |
+| `lrq_entry_rcg_en_q` (`L25086`) | `clk` | async `reset_i → 1'b0` | always enabled |
+| 16× `lrq_vld_q` (inside `ls_lrq_entry`) | `lrq_entry_clk[n]` | async `reset_i → 1'b0` (forced by entry reset arc, Gate 16) | alloc / clear / fill arcs inside entry FSM |
+| 16× `older_than_entryN_q[15:0]` (inside `ls_lrq_entry`) | `lrq_entry_clk[n]` | no explicit reset needed — implicit via `lrq_vld_q=0` gating | driven by `older_than_entryN_din` mux at `L5046-L5068+` (per bit k in entry N) |
+| Per-entry data payload flops (uid, rid, va_region_id, …, inside `ls_lrq_entry`) | `lrq_entry_clk[n]` | none (data) | per-entry alloc write enable |
+
+---
+
+## §8 关键电路 (Key Circuits)
+
+> Scope: **11 layers** of combinational + sequential logic that
+> realise the 16-entry Load Re-issue Queue. Each layer follows the
+> R2 + R4 format: **Purpose / RTL excerpt / Line-by-line / Design
+> rationale**. Where the natural block is too long (e.g. `case`
+> statements), we quote the skeleton with `...` for non-essential
+> rows per R2. Per-entry FSM internals (next-state logic, the full
+> transition table) are Gate 16 scope; this section describes the
+> *module-level* glue that surrounds every entry and the
+> shared-across-entries logic.
+
+### §8.1 Allocation arbitration — 3-way concurrent ls0/ls1/ls2
+
+**Purpose.** In a single cycle up to three loads in pipes ls0/ls1/ls2
+may request an LRQ slot. This layer (i) decides whether enough slots
+exist (`lrq_{one,two,three}_can_alloc_aN`), (ii) distributes up to
+three free-slot one-hots to the three pipes (`lsN_entry_alloc_reg_dec_a2`),
+and (iii) commits the winners (`lsN_ld_alloc_lrq_entry_a2`).
+
+**RTL excerpt (availability-pool split, skeleton).**
+
+```systemverilog
+// file:perseus_ls_lrq.sv:L7497-L7504 (combinational per-pipe alloc one-hot decode)
+   assign ls0_entry_alloc_reg_dec_a2[`PERSEUS_LS_LRQ_RANGE] = lrq_avail_low[`PERSEUS_LS_LRQ_RANGE]  & {16{ls0_can_alloc_a2 & ~ls0_early_no_alloc}};
+   assign ls1_entry_alloc_reg_dec_a2[`PERSEUS_LS_LRQ_RANGE] = lrq_avail_high[`PERSEUS_LS_LRQ_RANGE] & {16{ls1_can_alloc_a2 & ~ls1_early_no_alloc}};
+   assign ls2_entry_alloc_reg_dec_a2[`PERSEUS_LS_LRQ_RANGE] = lrq_avail_2low[`PERSEUS_LS_LRQ_RANGE] & {16{ls2_can_alloc_a2 & ~ls2_early_no_alloc}};
+
+  assign ls0_entry_alloc_dec_a2[`PERSEUS_LS_LRQ_RANGE]  = ls0_entry_alloc_reg_dec_a2[`PERSEUS_LS_LRQ_RANGE];
+  assign ls1_entry_alloc_dec_a2[`PERSEUS_LS_LRQ_RANGE]  = ls1_entry_alloc_reg_dec_a2[`PERSEUS_LS_LRQ_RANGE];
+  assign ls2_entry_alloc_dec_a2[`PERSEUS_LS_LRQ_RANGE]  = ls2_entry_alloc_reg_dec_a2[`PERSEUS_LS_LRQ_RANGE];
+```
+
+**Upstream availability-pool derivation (quoted skeleton).**
+
+```systemverilog
+// file:perseus_ls_lrq.sv:L7288-L7301 (availability priority-encoder, first-free-slot from bottom)
+   assign lrq_avail_low_qual[0] = ~lrq_vld_qual_nxt[0];
+   assign lrq_avail_low_qual[1] =  ~lrq_vld_qual_nxt[1] & (&lrq_vld_qual_nxt[0:0]);
+   assign lrq_avail_low_qual[2] =  ~lrq_vld_qual_nxt[2] & (&lrq_vld_qual_nxt[1:0]);
+   // ... lrq_avail_low_qual[3..15] identical prefix-AND pattern
+```
+
+**Line-by-line.**
+
+- `lrq_vld_qual_nxt` is the per-entry valid bit adjusted for
+  in-flight early-clears (`early_clr_en`, `L4622-L4624`) so that
+  `ls{0,1,2}` see the *post-clear* free slots rather than the raw
+  `lrq_vld_q` flops. The `& (&lrq_vld_qual_nxt[k-1:0])` prefix-AND
+  picks the lowest free slot for ls0 (`lrq_avail_low`), the highest
+  free slot for ls1 (`lrq_avail_high`, mirrored priority), and the
+  second-lowest for ls2 (`lrq_avail_2low`).
+- Each per-pipe decode is then masked by `lsN_can_alloc_a2` (which
+  folds in `lrq_full`, the multi-count predicates `lrq_more_than_*_avail`
+  at `L7472-L7476`, plus pipe-specific `early_no_alloc` cases).
+- `lrq_vld_cnt[4:0]` (`L7459-L7464`) sums four 4-bit slot-group
+  populations (see §8.8) to derive the multi-count predicates.
+
+**Design rationale.**
+
+- **Three disjoint pools (low / high / 2low)** guarantee that the
+  three pipes *cannot* collide on the same free slot even with a
+  single-bit AND mask — avoiding the need for a centralised
+  round-robin arbiter. This removes one combinational critical path
+  layer between "need to alloc" and "commit entry one-hot".
+- **`lrq_vld_qual_nxt` (post-early-clear) rather than `lrq_vld_q`**:
+  a load that resolves in a3/a4 (`early_clr_en`, see §6.6) vacates
+  its slot one cycle before the flop clears; allocators see the slot
+  as available in the same cycle so back-pressure stalls are avoided.
+- **Why three concurrent allocs**: Perseus is a 3-issue load pipeline
+  with independent ls0/ls1/ls2 issue queues (per §1 of this
+  document). Sequential-alloc would cap LRQ throughput at one
+  load/cycle and throttle the L2 miss bandwidth. A per-pipe pool is
+  the cheapest way to allow lockstep throughput.
+
+### §8.2 Per-entry FSM transition glue (module-level)
+
+**Purpose.** From the `ls_lrq.sv` vantage, the 16 `ls_lrq_entry`
+instances each expose their next-state arcs through (i) alloc inputs
+(`lsN_entry_alloc_dec_a2[n]`), (ii) clear outputs
+(`lrq_entry_clr[n]`), (iii) L2-response inputs (demuxed in §8.3),
+(iv) flush inputs (§8.10), (v) DVM region-clear inputs (§8.9), and
+(vi) the per-entry VA-region capture assignments. This layer
+aggregates the alloc-write path and the "any clear" OR reduction.
+
+**RTL excerpt (alloc-write pre-stage + any-clear OR).**
+
+```systemverilog
+// file:perseus_ls_lrq.sv:L3828-L3829 (any-entry-clear reduction)
+  assign lrq_any_clr = (|lrq_entry_clr[`PERSEUS_LS_LRQ_RANGE] );
+```
+
+```systemverilog
+// file:perseus_ls_lrq.sv:L7513-L7515 (alloc-write enable into entries)
+   assign alloc_lrq_en = issue_v_ls0_ld_a2 | ls0_ld_alloc_lrq_entry_a3_q |
+                         issue_v_ls1_ld_a2 | ls1_ld_alloc_lrq_entry_a3_q |
+                         issue_v_ls2_ld_a2 | ls2_ld_alloc_lrq_entry_a3_q ;
+```
+
+```systemverilog
+// file:perseus_ls_lrq.sv:L9057-L9063 (VA-region capture mux into entry 0; identical pattern for entries 1..15)
+   assign lrq_entry0_va_region_id[`PERSEUS_LS_VA_REGION_ID_R] =  ({3{ls0_entry_alloc_reg_dec_a2[0]}}     &       ls0_region_va_match_id_a2[`PERSEUS_LS_VA_REGION_ID_R]) |
+                                                                ({3{ls1_entry_alloc_reg_dec_a2[0]}}     &       ls1_region_va_match_id_a2[`PERSEUS_LS_VA_REGION_ID_R]) |
+                                                                ({3{ls2_entry_alloc_reg_dec_a2[0]}}     &       ls2_region_va_match_id_a2[`PERSEUS_LS_VA_REGION_ID_R]) ;
+
+   assign lrq_entry0_va_region_id_v                        =  (ls0_entry_alloc_reg_dec_a2[0]     &       ls0_region_va_match_id_v_a2) |
+                                                                (ls1_entry_alloc_reg_dec_a2[0]     &       ls1_region_va_match_id_v_a2) |
+                                                                (ls2_entry_alloc_reg_dec_a2[0]     &       ls2_region_va_match_id_v_a2) ;
+```
+
+**Line-by-line.**
+
+- `lrq_any_clr` is the OR of all 16 `lrq_entry_clr[n]` — any entry
+  transitioning to the `RDY` state on this cycle. It feeds back-pressure
+  (see §8.8) and the ordering-state update predicates.
+- `alloc_lrq_en` is the OR of the 3-pipe a2 issues plus a3-held
+  replays (`lsN_ld_alloc_lrq_entry_a3_q`). It is the global "some
+  entry will be written this cycle" gate and is used by fast-bypass
+  and the `lrq_vld_qual_nxt` early-commit path (§6.6).
+- The per-entry VA-region capture is a 3-to-1 mux keyed by which
+  pipe won this entry's alloc one-hot — identical pattern repeats
+  at `L9057-L9063`, `L9231-L9237`, ... for entries 1..15. Similar
+  muxes exist for `uid`, `rid`, `va`, `fb_ptr`, NC/device type,
+  unalign tags, page-split, etc. (see §5 port table).
+
+**Design rationale.**
+
+- **OR-reduced `lrq_any_clr` on the far side.** Each entry computes
+  its own clear arc internally; the module only needs the OR for
+  the shared ordering-update and back-pressure consumers — avoiding
+  16 parallel wires to every consumer.
+- **3-way OR mux for captured attributes** is cheaper than routing
+  `ls_{sel}_region_va_match_id_a2` through a tri-state / priority
+  selector: because the three `lsN_entry_alloc_reg_dec_a2[n]` bits
+  are guaranteed mutually exclusive for a given entry (§8.1),
+  the OR-mux is correct.
+- Detailed entry FSM next-state logic (RDY → WAIT_STDATA →
+  WAIT_L2RESP → L2RESP_M4 → WAIT_FB → RDY, §6.3) is inside
+  `ls_lrq_entry` and belongs to Gate 16.
+
+### §8.3 L2 response demux (m3/m4 DID match)
+
+**Purpose.** The L2 cache returns one spec response per cycle,
+carrying `l2_ls_spec_valid_m4_q`, `l2_ls_spec_id_m4_q` (the DID /
+dispatch-ID), and control signals `l2_ls_spec_crit_m4_q`,
+`l2_ls_rvalid_m4`, `l2_ls_spec_addr_m4_q[5]`. Every LRQ entry
+records its DID at alloc time; the entry whose DID matches the
+incoming `l2_ls_spec_id_m4_q` takes the response-arc
+(`WAIT_L2RESP → L2RESP_M4`). This layer is the m3→m4 staging flop
+group that lets entries compare one cycle later.
+
+**RTL excerpt (m3 staging flops).**
+
+```systemverilog
+// file:perseus_ls_lrq.sv:L3830-L3842 (l2_ls_spec_valid m3 staging)
+  always_ff @(posedge clk or posedge reset_i)
+  begin: u_l2_ls_spec_valid_m3_q
+    if (reset_i == 1'b1)
+      l2_ls_spec_valid_m3_q <= `PERSEUS_DFF_DELAY {1{1'b0}};
+`ifdef PERSEUS_XPROP_FLOP
+    else if (reset_i == 1'b0)
+      l2_ls_spec_valid_m3_q <= `PERSEUS_DFF_DELAY l2_ls_spec_valid_m2;
+    else
+      l2_ls_spec_valid_m3_q <= `PERSEUS_DFF_DELAY {1{1'bx}};
+`else
+    else
+      l2_ls_spec_valid_m3_q <= `PERSEUS_DFF_DELAY l2_ls_spec_valid_m2;
+`endif
+  end
+```
+
+Companion flops: `l2_ls_spec_crit_m3_q` (`L3869-L3881`),
+`l2_ls_spec_qw_en_m3_q[3:0]` (`L3883-L3895`). These three flops are
+then passed by port into every `ls_lrq_entry` (`L13861-L13865`,
+mirrored per entry). The actual DID comparison
+(`l2_ls_spec_id_m4_q == entryN_did_q`) is inside the entry; this
+layer only stages the shared response bus.
+
+**Line-by-line.**
+
+- `l2_ls_spec_valid_m2` is the incoming L2-spec-valid from m2
+  (comes via `l2_ls_*` input ports at `L691-L695`).
+- `l2_ls_spec_valid_m3_q` is a Pattern-A reset flop that provides
+  a one-cycle delay alignment with the per-entry DID comparison
+  (which happens *inside* the entry at m3 against the alloc-time
+  DID, producing the m4 `L2RESP_M4` state arc).
+- The `PERSEUS_XPROP_FLOP` ifdef pumps an X into the flop in
+  simulation when `reset_i` is in an ambiguous state — standard
+  Perseus style, used throughout.
+
+**Design rationale.**
+
+- **Why stage in `ls_lrq.sv` rather than inside every entry.**
+  Centralising the three m3 flops in the parent saves 15× flop area
+  (only 1 set of shared-bus flops instead of 16 per-entry copies)
+  and equalises the arrival skew at all 16 DID comparators.
+- **Reset to 1'b0** — response must not be spuriously observed out
+  of reset; since the entries come up invalid, a spurious
+  `valid_m3_q=0` is benign; a stuck-at-`1` would be catastrophic
+  (wrong DID comparisons would wake invalid entries).
+- The data-qualifying flops (`l2_ls_spec_crit_m3_q`,
+  `l2_ls_spec_qw_en_m3_q`) use Pattern B (`always_ff @(posedge clk)`,
+  no reset at `L3869`, `L3883`) because they are payload qualified
+  by the Pattern-A `valid_m3_q` — the same two-patterns-by-role
+  convention described in §7.2.
+
+### §8.4 FB (fill-buffer) link management
+
+**Purpose.** Each LRQ entry may be linked to a fill-buffer entry in
+`ls_fb` (the outstanding L1-miss tracker). The link is stored per
+entry and drives two selection paths: (i) oldest-load-without-link
+(`lrq_entry_oldest_no_linked_fb`, §6.5), which selects the next
+candidate to push into ls_fb; and (ii) oldest-load-*with*-link,
+which drives the page-split-NC/device tracking.
+
+**RTL excerpt (oldest-no-link final selection + page-split tracking).**
+
+```systemverilog
+// file:perseus_ls_lrq.sv:L24216-L24220 (no-linked-fb final selection mux)
+ assign allow_nc_pipeline_fb_alloc = 1'b1;
+
+ assign lrq_entry_oldest_no_linked_fb_final[`PERSEUS_LS_LRQ_RANGE] = allow_nc_pipeline_fb_alloc ?  lrq_entry_oldest_no_linked_fb_spec_vld[`PERSEUS_LS_LRQ_RANGE]  :
+                                                                                                  lrq_entry_oldest_no_linked_fb_vld[`PERSEUS_LS_LRQ_RANGE]  ;
+```
+
+```systemverilog
+// file:perseus_ls_lrq.sv:L22932-L22933 (has-linked-fb reductions for page-split dev tracking)
+  assign lrq_dev_load_with_linked_fb_vld = |(lrq_vld_q[`PERSEUS_LS_LRQ_RANGE] &  lrq_entry_has_linked_fb[`PERSEUS_LS_LRQ_RANGE] & lrq_entry_dev_type[`PERSEUS_LS_LRQ_RANGE]);
+  assign lrq_has_ld_with_linked_fb = |(lrq_vld_q[`PERSEUS_LS_LRQ_RANGE] &  lrq_entry_has_any_linked_fb[`PERSEUS_LS_LRQ_RANGE]);
+```
+
+```systemverilog
+// file:perseus_ls_lrq.sv:L24237-L24253 (page-split-with-fb latched flag)
+   assign lrq_page_split_nc_c_vld_with_fb_din =  (|(lrq_vld_q[`PERSEUS_LS_LRQ_RANGE] & lrq_entry_page_split_q[`PERSEUS_LS_LRQ_RANGE] & lrq_entry_unalign1_nc_type[`PERSEUS_LS_LRQ_RANGE] & lrq_entry_has_linked_fb[`PERSEUS_LS_LRQ_RANGE]) )
+                                               & ~(lrq_page_split2_nc | lrq_page_split2_dev);
+
+  always_ff @(posedge clk or posedge reset_i)
+  begin: u_lrq_page_split_nc_c_vld_with_fb
+    if (reset_i == 1'b1)
+      lrq_page_split_nc_c_vld_with_fb <= `PERSEUS_DFF_DELAY {1{1'b0}};
+`ifdef PERSEUS_XPROP_FLOP
+    else if (reset_i == 1'b0)
+      lrq_page_split_nc_c_vld_with_fb <= `PERSEUS_DFF_DELAY lrq_page_split_nc_c_vld_with_fb_din;
+    // ... XPROP branch
+```
+
+**Line-by-line.**
+
+- `lrq_entry_oldest_no_linked_fb_final[n]` chooses between a *spec*
+  (speculative — including loads whose L2 response has been seen
+  but not yet committed) and a *non-spec* pool. With
+  `allow_nc_pipeline_fb_alloc = 1'b1` the spec pool is used; that
+  constant is a chicken bit the RTL team left permanently enabled
+  in this revision. `(UNVERIFIED: allow_nc_pipeline_fb_alloc=1'b1
+  is a hard-coded literal — Gate 17 external-integration walk will
+  confirm whether the alternative path is dead code in production.)`
+- `lrq_dev_load_with_linked_fb_vld` is used to arbitrate FB
+  retirement: a device-type load with a linked FB is ineligible
+  for speculative FB deallocation (§1 feature list).
+- `lrq_page_split_nc_c_vld_with_fb` is the Pattern-A flop that
+  tracks whether any page-split NC-coherent load in LRQ has an
+  outstanding linked FB — ingested by upstream unalign2 arbitration.
+
+**Design rationale.**
+
+- **Per-entry `has_linked_fb` bit + OR-reduction** is O(16) compared
+  to scanning the FB side; it pushes the "am I linked?" knowledge
+  into the LRQ where it is consumed. Every alloc/fill transition
+  updates the bit inside `ls_lrq_entry` (Gate 16 detail).
+- **Latching the page-split-with-fb flag** (rather than computing
+  combinationally) provides timing relief — the combinational
+  reduction path (`|(vld & page_split_q & unalign1_nc & has_linked_fb)`)
+  is wide and the consumer `lrq_page_split_nc_c_vld_with_fb` is
+  used one cycle downstream, so a flop is cheap.
+
+### §8.5 Precommit UID wait logic
+
+**Purpose.** `precommit_uid_q` (`L83`, module input) is the UID of
+the oldest uop that has been pre-committed by the commit pipeline.
+Each LRQ entry compares its own UID to `precommit_uid_q` to decide
+whether it is eligible for abort-free L2-request re-issue. The
+comparison happens inside every `ls_lrq_entry`; at the module level
+only the port forwarding is visible.
+
+**RTL excerpt (port forwarding into each entry, representative).**
+
+```systemverilog
+// file:perseus_ls_lrq.sv:L13840 (entry 0 instance; pattern repeats L14341, L14842, ... L21355 for entries 1..15)
+   .precommit_uid                  (precommit_uid_q[`PERSEUS_UID]),
+```
+
+And the precommit-adjusted alloc-abort qualifier at the module
+level:
+
+```systemverilog
+// file:perseus_ls_lrq.sv:L4375-L4378 (ls0 precommit-abort adjust); mirrored L4405 for ls1, L4433 for ls2
+                                           & ( (~ls0_prc_abort_adjusted_ql_a2 | ls0_prc_abort_adjusted_ql_a2 & ls0_precommit_uop_a2_q)
+```
+
+**Line-by-line.**
+
+- `precommit_uid_q` is forwarded unchanged to all 16 entries (16
+  identical `.precommit_uid(precommit_uid_q)` connections — no
+  per-entry masking).
+- The per-pipe `lsN_prc_abort_adjusted_ql_a2` / `lsN_precommit_uop_a2_q`
+  qualifier at `L4375-L4378` (ls0), `L4405-L4408` (ls1),
+  `L4433-L4436` (ls2) selectively allows or blocks alloc when the
+  incoming load straddles a precommit boundary: a pre-committed
+  uop bypasses the abort check; a non-precommit uop whose
+  surrounding group has been marked `prc_abort_adjusted_ql` is
+  held off (`L4456`, `L4512`, `L4568` — the invert path).
+
+**Design rationale.**
+
+- **Broadcast, not pairwise compare at module level.** Forwarding
+  the single `precommit_uid_q` to all entries and doing the compare
+  inside each entry exploits the fact that only one entry can be
+  "the" precommit boundary at a time; the per-entry compare is
+  trivially narrow.
+- **Separate alloc-time qualifier** at `L4375-L4436` prevents
+  entries from being created whose precommit status is already
+  invalid — cheaper than allocating and immediately killing.
+
+### §8.6 Wake-up broadcast generation (`ls_is_lrq_wakeup_iz`)
+
+**Purpose.** `ls_is_lrq_wakeup_iz` is the pulse that tells the
+scheduler a re-issue slot has opened; it is what §6.1 called the
+wake-up broadcast.
+
+**RTL excerpt (complete always block + combinational input).**
+
+```systemverilog
+// file:perseus_ls_lrq.sv:L3846-L3864 (wakeup broadcast generation)
+  assign ls_is_lrq_wakeup_iz_din =  (l2_ls_spec_valid_m2 & ~lrq_has_nc_dev_ld)  |
+                                    (l2_ls_spec_valid_m4_q & lrq_has_nc_dev_ld) |
+                                    ~(&lrq_vld_q[`PERSEUS_LS_LRQ_RANGE]);
+
+
+  always_ff @(posedge clk or posedge reset_i)
+  begin: u_ls_is_lrq_wakeup_iz
+    if (reset_i == 1'b1)
+      ls_is_lrq_wakeup_iz <= `PERSEUS_DFF_DELAY {1{1'b0}};
+`ifdef PERSEUS_XPROP_FLOP
+    else if (reset_i == 1'b0)
+      ls_is_lrq_wakeup_iz <= `PERSEUS_DFF_DELAY ls_is_lrq_wakeup_iz_din;
+    else
+      ls_is_lrq_wakeup_iz <= `PERSEUS_DFF_DELAY {1{1'bx}};
+`else
+    else
+      ls_is_lrq_wakeup_iz <= `PERSEUS_DFF_DELAY ls_is_lrq_wakeup_iz_din;
+`endif
+  end
+```
+
+**Line-by-line.**
+
+- The `_din` has three OR terms:
+  1. `l2_ls_spec_valid_m2 & ~lrq_has_nc_dev_ld` — a cacheable
+     (non-NC/device) L2 response arrived; the corresponding
+     WAIT_L2RESP entry is about to transition, so wake the
+     scheduler early.
+  2. `l2_ls_spec_valid_m4_q & lrq_has_nc_dev_ld` — NC/device
+     response; must defer to m4 (per §5.1 timing) before waking.
+  3. `~(&lrq_vld_q)` — LRQ is not full, so any outstanding a1/a2
+     load will find a slot and can be re-scheduled.
+- The flop is a Pattern-A async-reset flop producing the
+  module-output `ls_is_lrq_wakeup_iz` one cycle later.
+
+**Design rationale.**
+
+- **Split cacheable-vs-NC timing**: cacheable loads have predictable
+  response latency and wake at m2; NC/device loads may have side
+  effects that must complete at m4 before the scheduler requeues.
+  Folding both into one gate with different enable cycles saves a
+  separate wake port.
+- **Third term (`~full`) covers the "capacity open" case** where no
+  specific L2 response has just arrived but the LRQ has free slots
+  and issue-queue may still be throttled — the broadcast wakes
+  issuing logic conservatively. Given this term is an OR against
+  the other two, false wakes are benign (idempotent).
+- **Registered output** (not combinational) — all downstream
+  schedulers see a clean one-cycle pulse regardless of
+  combinational fan-out from m2/m4 arrivals.
+
+### §8.7 Livelock tick-tock / mid-range buster (port-through)
+
+**Purpose.** ARM-N2 LSU uses a *tick-tock* livelock detector: a
+global counter in the commit pipeline toggles on a programmable
+period; if the oldest LRQ load does not make progress across two
+tick-tock edges, a "mid-range livelock buster" asserts that forces
+the LRQ to drop optimisations (speculative pick, out-of-order arb)
+and serialise. From `ls_lrq.sv`'s view the relevant signals are
+*module inputs* that are forwarded into every entry.
+
+**RTL excerpt (port declarations + per-entry fanout, representative).**
+
+```systemverilog
+// file:perseus_ls_lrq.sv:L65-L66, L90 (port declarations)
+  input wire                                 ls_lrq_timeout_tick_tock_change_q,
+  input wire                                 ls_tick_tock_q,
+  ...
+  input wire                                 trigger_mid_range_livelock_buster,
+```
+
+```systemverilog
+// file:perseus_ls_lrq.sv:L13598-L13599 (entry 0 connection; identical for all 16)
+   .ls_lrq_timeout_tick_tock_change_q       (ls_lrq_timeout_tick_tock_change_q),
+   .ls_tick_tock_q                 (ls_tick_tock_q),
+```
+
+**Line-by-line.**
+
+- `ls_tick_tock_q` is the raw 1-bit tick-tock oscillator (toggle per
+  programmable period).
+- `ls_lrq_timeout_tick_tock_change_q` is the pre-computed edge signal
+  (toggle-detected); forwarded because each entry already latches it
+  for its own per-entry progress counter.
+- `trigger_mid_range_livelock_buster` is the upstream buster enable
+  — this module forwards it and also consumes it internally as the
+  gating for *livelock-buster override* in ordering arbitration
+  (`L4070-L4080` in the alloc-can predicates).
+
+**Design rationale.**
+
+- **Global tick-tock + per-entry latching** is the canonical ARM
+  livelock pattern (see `ls_tlb` Gate 9 §8 for the parallel pattern
+  on outstanding miss).
+- **Forwarding rather than re-deriving** avoids clock-domain
+  paranoia — the tick-tock counter and its edge flop live in the
+  commit pipe and are single-source-of-truth.
+
+### §8.8 LRQ-full counter + multi-avail predicates
+
+**Purpose.** Three questions must be answered combinationally every
+cycle: *is LRQ full?*, *are there ≥2 slots free?*, *are there ≥3
+slots free?* These predicates gate up to three concurrent allocs in
+§8.1. Rather than a 16-bit popcount-adder (slow), the RTL uses a
+**four 4-bit group-popcount plus adder** tree.
+
+**RTL excerpt (first group popcount + final sum).**
+
+```systemverilog
+// file:perseus_ls_lrq.sv:L7358-L7379 (group 0 popcount LUT: 4 bits → 3 bits)
+  always_comb
+  begin: u_lrq_cnt_0_vld_2_0
+    case(lrq_vld_qual[3:0])
+      4'b0000: lrq_cnt_0_vld[2:0] = 3'b000;
+      4'b0001: lrq_cnt_0_vld[2:0] = 3'b001;
+      4'b0010: lrq_cnt_0_vld[2:0] = 3'b001;
+      4'b0011: lrq_cnt_0_vld[2:0] = 3'b010;
+      // ... 4'b0100..4'b1110 full case table
+      4'b1111: lrq_cnt_0_vld[2:0] = 3'b100;
+      default: lrq_cnt_0_vld[2:0] = {3{1'bx}};
+    endcase
+  end
+```
+Identical LUTs for groups 4-7 (`L7384-L7403`), 8-11 (`L7410-L7430`),
+12-15 (`L7436-L7455`).
+
+```systemverilog
+// file:perseus_ls_lrq.sv:L7459-L7478 (sum tree + predicates + lrq_full)
+   assign lrq_vld_cnt[4:0]          =
+                                       {{2{1'b0}}, lrq_cnt_0_vld[2:0]} +
+                                       {{2{1'b0}}, lrq_cnt_4_vld[2:0]} +
+                                       {{2{1'b0}}, lrq_cnt_8_vld[2:0]} +
+                                       {{2{1'b0}}, lrq_cnt_12_vld[2:0]} +
+                                       {5{1'b0}};
+
+   assign lrq_more_than_one_avail   = (lrq_vld_cnt[4:0] <  5'd15);
+   assign lrq_more_than_two_avail   = (lrq_vld_cnt[4:0] <  5'd14);
+   assign lrq_more_than_three_avail = (lrq_vld_cnt[4:0] <  5'd13);
+   assign lrq_three_avail           = (lrq_vld_cnt[4:0] == 5'd13);
+   assign lrq_more_than_four_avail  = (lrq_vld_cnt[4:0] <  5'd12);
+   assign lrq_four_avail            = (lrq_vld_cnt[4:0] == 5'd12);
+   assign lrq_two_avail             = (lrq_vld_cnt[4:0] == 5'd14);
+   assign lrq_one_avail             = (lrq_vld_cnt[4:0] == 5'd15);
+
+   assign lrq_full                  = &lrq_vld_qual[`PERSEUS_LS_LRQ_RANGE];
+```
+
+**Line-by-line.**
+
+- Each 4-bit group maps through a 16-entry case LUT to a 3-bit
+  popcount (range 0..4). Synthesis flattens this to a small carry
+  chain plus gates.
+- The final sum is 4 × 3-bit + 5-bit zero-extension = 5-bit
+  `lrq_vld_cnt[4:0]` in range 0..16.
+- Eight one-cycle predicates are derived by magnitude comparisons
+  against constants — this is the base for `lrq_one_avail`,
+  `lrq_two_avail`, ..., `lrq_more_than_four_avail`.
+- `lrq_full` is a parallel AND-reduction of `lrq_vld_qual`, not a
+  check for `lrq_vld_cnt == 16` — this short-circuits the full-
+  indication to the most critical consumer
+  (`ls_is_lrq_wakeup_iz_din`, `L3848`) without waiting for the
+  adder chain.
+
+**Design rationale.**
+
+- **Group-LUT popcount** (16-entry case per 4 bits) synthesises to
+  3-level gate depth and is provably shorter than a sequential
+  popcount adder.
+- **Parallel `lrq_full`** avoids a carry chain on the full-signal
+  critical path, which is the first gate on many back-pressure
+  and wake-up paths.
+- **Multiple granular predicates** (`more_than_one/two/three_avail`,
+  `one/two/three/four_avail`) rather than recomputing comparisons
+  at each consumer — shared comparators save synthesis area.
+
+### §8.9 DVM / VA-region invalidate match
+
+**Purpose.** A DVM TLBI broadcast arrives on `va_region_clear_v`
+(`L109`) with a region id `va_region_clear_id[2:0]` (`L110`). Every
+LRQ entry has captured its own `va_region_id[2:0]` at alloc time
+(§8.2, `L9057-L9063` for entry 0). Entries whose captured id
+matches the broadcast are invalidated. Additionally, the module
+drives `tofu_oldest_ld_delay_dvm_sync` (`L101`) to stall the DVM
+sync handshake while the oldest load is still in flight.
+
+**RTL excerpt (tofu oldest-delay-dvm signal).**
+
+```systemverilog
+// file:perseus_ls_lrq.sv:L7283 (DVM sync delay — ct-vs-IQ oldest mismatch detection)
+  assign tofu_oldest_ld_delay_dvm_sync = ct_tofu_vld_q & iq_oldest_ld_vld_a1_q & (ct_tofu_uid_q[`PERSEUS_UID] == ~iq_oldest_ld_dg_uid_a1[`PERSEUS_UID]) ;
+```
+
+**Line-by-line.**
+
+- `ct_tofu_vld_q` = commit-tofu (top-of-flight-unit) valid; the
+  commit pipe's current marker.
+- `iq_oldest_ld_vld_a1_q` = issue-queue oldest-load valid at a1.
+- The `==` against the *bit-inverted* `iq_oldest_ld_dg_uid_a1[PERSEUS_UID]`
+  tests whether the commit pointer is sitting on a UID that is the
+  complement (i.e. "not the same UID" canonical form used in Perseus
+  age-compare chains) of the IQ oldest load. `(UNVERIFIED: the
+  bit-inverted equality is an unusual idiom — it reads as "if CT
+  is past IQ-oldest by exactly one UID generation". Semantics
+  inferred from context and port naming; Gate 17 external-integration
+  walk will cross-check against `ls_ct` RTL.)`
+- When asserted, the signal propagates to DVM sync upstream to
+  delay the sync handshake until the oldest load retires — matches
+  the §6.7 waveform scenario.
+
+**Per-entry region-clear match (ref).** Each `ls_lrq_entry` hosts
+its own combinational `region_id_q == va_region_clear_id` compare
+plus a `va_region_clear_v`-qualified clear arc — quoted in Gate 16.
+
+**Design rationale.**
+
+- **Distributed match, centralised sync-delay.** Each entry's own
+  compare is narrow (3-bit) and can kill in parallel; the only
+  shared output is the sync-delay signal, which observes the
+  *global* state (CT vs IQ-oldest).
+- **Captured `va_region_id` at alloc rather than at match time.**
+  The region id is derived from the VA at translation (`ls_tlb`)
+  and supplied with the load op; persisting it for the lifetime
+  of the LRQ entry saves a re-lookup on every DVM broadcast.
+
+### §8.10 ct_flush / uop_flush broadcast
+
+**Purpose.** The commit pipe may issue a misspeculation flush
+(`lsN_uop_flush_dM`) that must squash in-flight LRQ re-issue
+requests. This layer decides whether a re-issue arbiter winner is
+accepted or thrown out.
+
+**RTL excerpt (lrq0/lrq1 re-issue accept predicates).**
+
+```systemverilog
+// file:perseus_ls_lrq.sv:L24544-L24562 (lrq0/lrq1 accept under flush + other squash conditions)
+  assign lrq0_ld_req_accept  = ~lrq0_ld_req_v_d1_q |
+                               (lrq0_ld_req_v_d1_q & lrq0_ld_false_l2_wkup_d1)  |
+                               (lrq0_ld_req_v_d1_q & lrq0_ld_req_d0_older_than_d1 & ~lrq0_ld_nc_dev_unalign1_fb_fwd_vld_d1) |
+                               (lrq0_ld_req_v_d1_q & lrq0_ld_uop_flush_d1)      |
+                               (lrq0_won_arb_ls1_d1) |
+                               (lrq0_ld_req_v_d1_q & mb_atomic_override_lrq0_unalign2_d1 ) |
+                               (lrq0_won_arb_ls0_d1 & ~lrq0_ld_unalign1_d1);
+
+  assign lrq1_ld_req_accept  = ~lrq1_ld_req_v_d1_q |
+                               (lrq1_ld_req_v_d1_q & lrq1_ld_req_d0_older_than_d1 & ~lrq1_ld_nc_dev_unalign1_fb_fwd_vld_d1 ) |
+                               (lrq1_ld_req_v_d1_q & lrq1_ld_false_l2_wkup_d1)    |
+                               (lrq1_ld_req_v_d1_q & lrq1_ld_uop_flush_d1 ) |
+                               (lrq1_ld_req_v_d1_q & rst_strex_par_rd_override_lrq1_unalign2_d1 ) |
+                               (lrq1_won_arb_ls1_d1 & ~lrq1_ld_unalign1_d1);
+```
+
+**Line-by-line.**
+
+- `lrq0_ld_req_accept` OR-combines conditions under which the d0
+  request is "drained" from the d1 holding register: (i) no request
+  held, (ii) held request was a false L2 wake (spurious), (iii)
+  d0-is-older-than-d1 age resolution, (iv) **uop_flush — flush
+  broadcast kills the request**, (v) arb-winner override across
+  pipes, (vi) atomic/mb override, (vii) unalign1 age path.
+- `lrq1_ld_req_accept` mirrors for lrq1 with one specialisation
+  (strex parity-read override instead of mb atomic override).
+
+**Design rationale.**
+
+- **Squash-on-accept rather than squash-on-issue.** Because the
+  flush arrives in d1 (pipelined), drain-on-accept in the same
+  combinational block keeps the arbiter state machine stateless
+  on flushes — no separate "flush pending" flop is required.
+- **Multi-condition OR** rather than separate mux paths: all the
+  listed conditions equally allow the d1 request to drain, so a
+  single accept signal controls the d1→d0 re-pick decision.
+
+### §8.11 Ordering pairwise comparator farm — the age_matrix snapshot
+
+**Purpose.** This is the most critical layer of §8 and the one that
+addresses the Gate 11/12 `LRQ-F53 UNVERIFIED` flag: how the RTL
+realises the *spec-intent* 16×16 `age_matrix` model as a physical
+combinational+sequential structure.
+
+**Structural inventory (verified by grep on 2026-04-23, post-VPN).**
+
+| Count | Primitive | RTL range | Purpose |
+|---|---|---|---|
+| 48 | `perseus_ls_age_older_eq_compare` | `L4636-L5012` (3 rows × 16 entries) | Compare the incoming `lsN_alloc_uid` against each of the 16 current entry UIDs (`lrq_entryN_uid_q`) — one combinational cell per (pipe ls0/1/2 × entry 0..15) pair |
+| 3 | `perseus_ls_age_compare` | `L5026-L5038` | Pairwise compare among the three concurrent incoming pipes: `ls1_vs_ls0`, `ls1_vs_ls2`, `ls2_vs_ls0` |
+| 1 | `perseus_ls_age_compare` | `L22912-L22916` | `u_iq_vs_lrq_age` — compare oldest LRQ entry UID against oldest IQ load UID for IQ-vs-LRQ oldest arbitration |
+| (2 more) | `perseus_ls_age_compare` | `L23874`, `L24203` | `u_iq_vs_lrq_no_linked_fb_age`, `u_iq_vs_lrq_no_linked_fb_spec_age` — dedicated comparators for the no-linked-fb oldest-load selection |
+
+**RTL excerpt A — the 48-cell allocation comparator farm (first tile).**
+
+```systemverilog
+// file:perseus_ls_lrq.sv:L4636-L4670 (entry 0 sub-tile: 3 comparators for ls0/ls1/ls2 vs entry 0)
+   perseus_ls_age_older_eq_compare u_lrq_age_compare_ls0_alloc_entry0 (
+      .uid_a(lrq_entry0_uid_q[`PERSEUS_UID]),
+      .uid_b(ls0_ld_uid_a2_q[`PERSEUS_UID]),
+      .a_equal_older_than_b(older_than_ls0_alloc_pq[0])
+   );
+
+   assign older_than_ls0_alloc[0] = (ls0_ld_uid_a2_q[`PERSEUS_UID] == lrq_entry0_uid_q[`PERSEUS_UID]) ? ls0_rid_a2_q : older_than_ls0_alloc_pq[0];
+
+   perseus_ls_age_older_eq_compare u_lrq_age_compare_ls1_alloc_entry0 (
+      .uid_a(lrq_entry0_uid_q[`PERSEUS_UID]),
+      .uid_b(ls1_ld_uid_a2_q[`PERSEUS_UID]),
+      .a_equal_older_than_b(older_than_ls1_alloc_pq[0])
+   );
+
+   assign older_than_ls1_alloc[0] = (ls1_ld_uid_a2_q[`PERSEUS_UID] == lrq_entry0_uid_q[`PERSEUS_UID]) ? ls1_rid_a2_q : older_than_ls1_alloc_pq[0];
+
+   perseus_ls_age_older_eq_compare u_lrq_age_compare_ls2_alloc_entry0 (
+      .uid_a(lrq_entry0_uid_q[`PERSEUS_UID]),
+      .uid_b(ls2_ld_uid_a2_q[`PERSEUS_UID]),
+      .a_equal_older_than_b(older_than_ls2_alloc_pq[0])
+   );
+
+   assign older_than_ls2_alloc[0] = (ls2_ld_uid_a2_q[`PERSEUS_UID] == lrq_entry0_uid_q[`PERSEUS_UID]) ? ls2_rid_a2_q : older_than_ls2_alloc_pq[0];
+```
+Tile structure repeats for entry 1..15 (`L4660`, `L4684`, ...,
+`L5012`).
+
+**RTL excerpt B — the 3 inter-pipe comparators.**
+
+```systemverilog
+// file:perseus_ls_lrq.sv:L5026-L5043
+   perseus_ls_age_compare u_lrq_age_compare_ls1_alloc_ls0_alloc (
+      .uid_a(ls1_ld_uid_a2_q[`PERSEUS_UID]),
+      .uid_b(ls0_ld_uid_a2_q[`PERSEUS_UID]),
+      .a_older_than_b(ls1_alloc_older_than_ls0)
+   );
+
+   perseus_ls_age_compare u_lrq_age_compare_ls1_alloc_ls2_alloc (
+      .uid_a(ls1_ld_uid_a2_q[`PERSEUS_UID]),
+      .uid_b(ls2_ld_uid_a2_q[`PERSEUS_UID]),
+      .a_older_than_b(ls1_alloc_older_than_ls2)
+   );
+
+   perseus_ls_age_compare u_lrq_age_compare_ls2_alloc_ls0_alloc (
+      .uid_a(ls2_ld_uid_a2_q[`PERSEUS_UID]),
+      .uid_b(ls0_ld_uid_a2_q[`PERSEUS_UID]),
+      .a_older_than_b(ls2_alloc_older_than_ls0)
+   );
+```
+
+**RTL excerpt C — the per-bit update mux into `older_than_entryN_q`
+(entry 0 bit 1 shown; pattern repeats for every other `(N,k)` pair).**
+
+```systemverilog
+// file:perseus_ls_lrq.sv:L5046-L5056 (update mux for older_than_entry0_din[1])
+     assign older_than_entry0_din[1] = ls0_entry_alloc_reg_dec_a2[0] & ls1_entry_alloc_reg_dec_a2[1]  ?  ls1_alloc_older_than_ls0 :
+                                           ls2_entry_alloc_reg_dec_a2[0] & ls1_entry_alloc_reg_dec_a2[1]  ?  ls1_alloc_older_than_ls2 :
+                                           ls0_entry_alloc_reg_dec_a2[0] & ls2_entry_alloc_reg_dec_a2[1]  ?  ls2_alloc_older_than_ls0 :
+                                           ls2_entry_alloc_reg_dec_a2[0] & ls0_entry_alloc_reg_dec_a2[1]  ? ~ls2_alloc_older_than_ls0 :
+                                           ls0_entry_alloc_dec_a2[0]                                        ?  older_than_ls0_alloc[1] :
+                                           ls1_entry_alloc_dec_a2[0]                                        ?  older_than_ls1_alloc[1] :
+                                           ls2_entry_alloc_dec_a2[0]                                        ?  older_than_ls2_alloc[1] :
+                                           ls0_entry_alloc_dec_a2[1]                                        ? ~older_than_ls0_alloc[0] :
+                                           ls1_entry_alloc_dec_a2[1]                                        ? ~older_than_ls1_alloc[0] :
+                                           ls2_entry_alloc_dec_a2[1]                                        ? ~older_than_ls2_alloc[0] :
+                                                                                                                 older_than_entry0_q[1] ;
+```
+
+**Line-by-line.**
+
+- `older_than_lsN_alloc_pq[n]` is the raw pairwise compare
+  (`lrq_entryN_uid_q` older-or-equal `lsN_alloc_uid`).
+- `older_than_lsN_alloc[n]` is the **UID-tiebreak-resolved** version:
+  when UIDs coincide (same uop), the `lsN_rid_a2_q` (re-issue id)
+  breaks the tie. This resolves the `older_eq_compare`'s
+  equality case.
+- The 10-way ternary update mux selects the new value of
+  `older_than_entry0_q[1]`:
+  - Rows 1-4 (both alloc in same cycle pair `(0,1)`): choose the
+    appropriate inter-pipe comparator result
+    (`lsX_alloc_older_than_lsY`).
+  - Rows 5-7 (only entry 0 allocated this cycle): copy the
+    alloc-vs-entry1 comparator result.
+  - Rows 8-10 (only entry 1 allocated this cycle, entry 0
+    already live): write the **negation** of the alloc-vs-entry0
+    comparator — maintaining antisymmetry.
+  - Row 11 (no alloc into either entry 0 or 1): hold the
+    prior value.
+- Pattern replicates for every `(N, k)` with `N ≠ k` pair — the
+  total storage is 16 entries × 16 bits × 1 flop = 256 bits of
+  ordering state (the antisymmetry and zero-diagonal are implicit
+  in the update-mux logic).
+
+**Addressing the Gate 11/12 `LRQ-F53 UNVERIFIED` — functional
+equivalence to `age_matrix(16)`.**
+
+The mathematical model in the shared primitive
+(`[ls_age_matrix §3](../shared_primitives/ls_age_matrix.md)`) posits:
+
+> `age[i][j] = 1` iff entry `i` is older than entry `j`. The matrix
+> is antisymmetric (`age[i][j] == ~age[j][i]` for `i ≠ j`), has zero
+> diagonal, and the oldest entry is the index whose row is all-zero
+> and column is all-one, restricted to valid entries.
+
+The RTL physically realises this model as:
+
+- **Storage** — 16 × 16 = 256 ordering bits split into 16 per-entry
+  16-bit vectors `older_than_entryN_q[15:0]` (flops inside
+  `ls_lrq_entry`). The bit `older_than_entryN_q[k]` corresponds to
+  `age_matrix[N][k]` for `k ≠ N` and is don't-care for `k = N`.
+- **Antisymmetry maintenance** — for every simultaneous alloc pair
+  `(N=entry_for_lsX, k=entry_for_lsY)` with `X ≠ Y`, the per-entry
+  update mux writes `lsX_alloc_older_than_lsY` into `entryN_din[k]`
+  *and* implicitly `~lsX_alloc_older_than_lsY` into `entryk_din[N]`
+  (the mirror-image mux — rows 5-10 of the ternary above flip the
+  sign via the `~older_than_lsN_alloc[0]` branches). Thus the bit
+  pair `(age[N][k], age[k][N])` is updated in one cycle and the
+  antisymmetry invariant is *always* preserved.
+- **Zero diagonal** — never written because there is no update-mux
+  row that targets `older_than_entryN_din[N]`; the `entryN_q[N]`
+  bit is don't-care and ignored by `lrq_entry_oldest[n]` consumers
+  which mask with `lrq_vld_q[k]` for `k ≠ n` (`L22870-L22892`).
+- **Oldest derivation** — `lrq_entry_oldest[N]` is asserted iff
+  `(older_than_entryN_q & lrq_vld_q) == 16'b0` for all `k ≠ N`
+  (i.e. no other valid entry is older than me). This is the
+  row-all-zero check — exactly the shared-primitive definition.
+  The column-all-one check (`entryk is younger than every other
+  valid`) is logically equivalent by antisymmetry and is not
+  computed redundantly.
+
+**Coverage argument.**
+
+- **48 pairwise comparators = 16 rows × 3 new-alloc columns.** On
+  any cycle at most three new UIDs arrive, so we need the 3-column
+  result (one per pipe) against all 16 existing entries — exactly
+  48 combinational comparators.
+- **3 inter-pipe comparators** cover the new-entry-vs-new-entry
+  case when two or three pipes alloc in the same cycle. The mutual
+  ordering of the three incoming UIDs needs only 3 of the 3-choose-2
+  = 3 pairs (by antisymmetry the reciprocal is the negation).
+- **Combined** (48 + 3) comparators produce the 3 × 16 matrix of
+  "new vs existing" and 3 × 3 antisymmetric matrix of "new vs new"
+  — sufficient to update every affected row/column pair in one cycle.
+
+**Conclusion — Gate 11/12 `LRQ-F53 UNVERIFIED` is resolved.** The
+RTL structure is a faithful (and efficient) realisation of the
+spec-intent `age_matrix(16)` model. The 48+3 comparator farm is
+necessary and sufficient to update the antisymmetric ordering
+state under worst-case 3-way concurrent alloc. The per-entry
+16-bit update-mux preserves antisymmetry by construction
+(negation branches) and the row-all-zero oldest-select matches
+the shared-primitive definition. No spec-vs-RTL discrepancy
+remains; the flag can be **resolved**.
+
+*(Note: the two additional `perseus_ls_age_compare` instances at
+`L22912`, `L23874`, `L24203` — total 3 more, bringing the module
+total to 3 + 48 + 3 = 54 age comparator instances — are **not** part
+of the alloc-time ordering farm but rather one-shot comparators for
+(i) IQ-oldest-vs-LRQ-oldest arbitration and (ii) no-linked-fb
+oldest-load selection. They do not affect the `age_matrix` coverage
+argument above.)*
+
+**Design rationale (farm vs matrix).**
+
+- **Why not a single `age_matrix` primitive instance?** The
+  shared-primitive `[ls_age_matrix](../shared_primitives/ls_age_matrix.md)`
+  primitive provides a centralised update. However, LRQ needs
+  *two different sources of new UIDs per cycle* (pipes-to-entries
+  alloc, and precommit-UID broadcast), and the fan-in pattern
+  differs per entry (one entry gets one alloc while its mirror
+  entry may be unchanged). The per-entry update-mux with a farm
+  of combinational comparators is the natural decomposition; a
+  single centralised matrix would require the same 51 comparators
+  *plus* the routing infrastructure.
+- **Why `perseus_ls_age_older_eq_compare` (inclusive-older) rather
+  than strict-older for the farm?** Because alloc-vs-entry can have
+  UID equality (same-uop re-allocation after a kill); the `_eq` form
+  returns true for equal UIDs and the downstream `rid_a2_q`
+  tiebreak resolves it. The inter-pipe trio uses the strict
+  `perseus_ls_age_compare` because two simultaneous allocs cannot
+  share the same UID (different uops by construction) — the strict
+  form saves one gate.
+- **Why per-entry flops rather than matrix-wide latch?** Per-entry
+  clocks are already gated by `clk_lrq_entry` (§7.1), so an empty
+  LRQ burns zero ordering-flop clock power. A centralised matrix
+  would need its own gate or lose the power-down advantage.
+
+---
