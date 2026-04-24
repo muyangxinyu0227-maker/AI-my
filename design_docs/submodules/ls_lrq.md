@@ -198,4 +198,303 @@ Functional-equivalence argument to the matrix model, and the naming of the
 
 ---
 
-<!-- §3 onwards deferred to Tasks 13-18 (Gates 12-17). Do not fill here. -->
+<!-- §5 onwards deferred to Tasks 14-18 (Gates 13-17). Do not fill here. -->
+
+## §3 微架构抽象 (Microarchitectural Abstraction)
+
+> Framing reminder (per R5 and the document header): the design spec is the
+> authoritative source-of-intent; the RTL snapshot is a delivered subset.
+> Where the two diverge on *mechanism*, this section records both sides in
+> parallel ("spec-intent" vs "current RTL snapshot") without marking either
+> as wrong.
+
+### §3.1 What — one-paragraph model
+
+The `perseus_ls_lrq` is a **per-entry state-machine queue** sitting
+MSHR-adjacent to the fill-buffer (`ls_fb`). Sixteen entries (`LRQ-F01`)
+each run an independent 10-state FSM (`LRQ-F02`; state encoding at
+`perseus_ls_defines.sv:L725-L735`, verified in Gate 11) that tracks a
+single outstanding load from the moment it leaves the AGU pipe until it
+has produced an architectural result and released. Entries are coupled to
+the fill-buffer through per-entry linkage IDs (`ld_linked_fb_rst_id_q`,
+`ld_has_linked_fb*`; `LRQ-F29` / `LRQ-F30`) so that multiple LRQ entries
+chasing the same missing cache line can share one `ls_fb` slot ("miss
+coalescing" in the classic MSHR sense, with LRQ playing the
+"I-am-waiting" role and FB playing the "I-have-requested-the-line"
+role). Relative program age among the 16 in-flight entries is supplied
+by an **ordering primitive** whose mechanism differs between spec-intent
+and the current RTL snapshot — see §3.4 below.
+
+Three external contracts define the queue's behaviour from outside:
+(a) at `d2`, up to three entries may be allocated in the same cycle from
+`ls0` / `ls1` / `ls2` (`LRQ-F05` / `LRQ-F06`); (b) at `d0`, entries
+compete with fresh AGU ops via `disable_lrq{0,1}_pick_nxt` to reissue
+(`LRQ-F12`); (c) at `iz`, the `ls_is_lrq_wakeup_iz` broadcast releases
+dependent ops in ICSU (`LRQ-F16`).
+
+### §3.2 How — lifecycle of one entry
+
+The primary lifecycle (cache-miss → L2-response → release) is:
+
+```
+  RDY ─(alloc @ d2)──▶ IN_PIPE ─(d3/d4 miss captured)──▶ WAIT_L2RESP
+                                                            │
+                                                            ├─(L2 spec_valid @ m2, non-NC/dev)──▶ L2RESP_M3
+                                                            └─(L2 spec_valid @ m4_q, NC/dev)────▶ L2RESP_M4
+                                                                                   │
+                                                                                   ├─(re-arb wins d0)──▶ IN_PIPE ─▶ … ─▶ WAIT_FB
+                                                                                   └─(FB not yet clear)─▶ WAIT_FB
+                                                                                                             │
+                                                                                                             └─(FB link cleared)──▶ RDY
+```
+
+(Evidence: FSM `casez` at `perseus_ls_lrq_entry.sv:L2341-L2407`; M2/M4
+wake-up drivers at `perseus_ls_lrq.sv:L3846-L3847`; re-arb rows
+`LRQ-F17`; FB-wait state `LRQ-F28`.)
+
+Three lateral branches leave the primary line and rejoin it:
+
+- **Store-to-load dependency branch** — `WAIT_STDATA` +
+  `STDATA_SPEC_WKUP` (`LRQ-F18` / `LRQ-F19`): an entry that depends on a
+  not-yet-written store parks in `WAIT_STDATA` until `ls_ld_std_wakeup`
+  fires on a matching STID, optionally taking an early exit through
+  `STDATA_SPEC_WKUP` when the speculative-wakeup config bit permits
+  (`LRQ-F20`).
+- **Program-order branch** — `WAIT_OLD_PRECOMMIT` (`LRQ-F21`): an entry
+  whose UID is younger than `precommit_uid_q` is held until the commit
+  frontier reaches it; the NC/device L2 wake-up path (`LRQ-F24`) is
+  driven out of this state.
+- **LPT-hazard branch** — `WAIT_LPT` (`LRQ-F26`): an entry with a pending
+  load-pending-tag conflict parks until the 7-bit `lpt_wait_id_q`
+  vector's AND-reduce (`ld_lpt_wait_on_all`) fires.
+
+Allocation is **spatial** (parallel, not pointered): at `d2` the three
+allocators `ls{0,1,2}_alloc` choose among free entries (`entry_vld_q=0`)
+under the qualifiers `ls{0,1,2}_block_lrq_alloc_a2_q`. Cross-pipe age
+tie-breaks come from the `*_uop_older_than_*_a1_q` hints and three
+`perseus_ls_age_compare` cells (`LRQ-F06`;
+`perseus_ls_lrq.sv:L5026-L5038`). Per-allocator vs per-entry pairwise
+age is computed by 48 `perseus_ls_age_older_eq_compare` cells
+(`LRQ-F07`; `perseus_ls_lrq.sv:L4636-L5012`). Release is **implicit**:
+when an entry's FSM returns to `RDY` and `entry_vld_q` clears, the slot
+is immediately available for re-allocation; there is no explicit "free
+pointer."
+
+### §3.3 Why — design rationale
+
+- **Per-entry FSM vs. central controller.** 16 independent FSMs allow
+  all 16 in-flight loads to progress simultaneously through unrelated
+  states (one in `WAIT_L2RESP`, another in `WAIT_STDATA`, another in
+  `L2RESP_M4`, etc.). A single central controller would need to
+  sequence these, serialising wake-ups and defeating the purpose of a
+  16-entry miss tracker.
+- **10 states, not fewer.** Each state names a distinct *reason* the
+  load is parked (`WAIT_L2RESP` = line not yet back; `WAIT_STDATA` =
+  older store's data not ready; `WAIT_OLD_PRECOMMIT` = program-order
+  gate; `WAIT_LPT` = tag hazard; `WAIT_FB` = FB not yet freed;
+  `L2RESP_M3/M4` = in-flight response capture). Collapsing them would
+  hide the reason from replay/debug/livelock detection
+  (`trigger_mid_range_livelock_buster`, `LRQ-F38`) and from the
+  two-edged timeout scheme (`LRQ-F36`).
+- **Age-primitive ordering vs. FIFO pointer.** L2 responses return in
+  arbitrary order (cache-line granularity, coalescing, NC vs cacheable
+  paths) and three allocators can insert on one cycle, so a single
+  head/tail pointer cannot express "oldest live entry." An age primitive
+  answers that in one cycle regardless of the underlying storage order.
+  This rationale holds for **both** the spec-intent mechanism and the
+  current RTL snapshot mechanism discussed in §3.4.
+- **MSHR-adjacent (not MSHR-integrated).** LRQ tracks "I am a load that
+  is waiting"; FB tracks "there is one request outstanding for this
+  line." Keeping them in separate structures — with `ld_linked_fb_*`
+  linkage IDs — lets several LRQ entries share one FB slot (classic
+  miss coalescing) and lets an LRQ entry stay alive across FB
+  re-allocation, which a single combined structure could not.
+
+### §3.4 Ordering mechanism — spec-intent vs current RTL snapshot
+
+> This subsection is the Gate 12 restatement of the Gate 11 observation
+> recorded at `§1.5` and feature `LRQ-F53`. Per the pilot framing rule,
+> both sides are recorded in parallel.
+
+- **Spec-intent mechanism.** The pilot design spec
+  (`docs/superpowers/specs/design_spec/2026-04-22-lsu-rtl-deep-dive-design.md:L154`)
+  and the shared-primitive document
+  (`design_docs/shared_primitives/ls_age_matrix.md:§1` / `§7.1`) record
+  the LRQ's ordering primitive as **`perseus_ls_age_matrix`** with
+  `AM_SIZE=16`: a single matrix cell holding the full younger-than
+  relation among all 16 entries, answering "oldest live entry"
+  (optionally class-filtered) in one cycle every cycle. Under this
+  model, every LRQ entry is a *row and column* of one shared matrix,
+  and the "oldest" reducer is the matrix's per-row AND of older-than
+  bits masked by `entry_vld_q`.
+- **Current RTL snapshot mechanism.** In the
+  `PERSEUS-MP128-r0p3-00rel0` snapshot of `perseus_ls_lrq.sv`, the
+  `perseus_ls_age_matrix` cell is not instantiated (Gate 11 grep
+  evidence, §1.5). Instead the same logical question ("for allocator X,
+  which of the 16 live entries is older?") is answered by a **pairwise
+  comparator farm** built from two primitive cells:
+  - 48 × `perseus_ls_age_older_eq_compare` at
+    `perseus_ls_lrq.sv:L4636-L5012` — one per (allocator, entry) pair,
+    i.e. 3 allocators × 16 entries.
+  - 3 × `perseus_ls_age_compare` at `perseus_ls_lrq.sv:L5026-L5038` —
+    one per cross-allocator pair (`ls1_alloc` vs `ls0_alloc`,
+    `ls1_alloc` vs `ls2_alloc`, `ls2_alloc` vs `ls0_alloc`).
+  Each entry also drives `lrq_entry_oldest_vld[i]` / `lrq_oldest_vld` /
+  `lrq_overall_oldest_vld` wires (`LRQ-F08`;
+  `perseus_ls_lrq.sv:L1060, L3200, L3259`) that re-expose an
+  "oldest-entry" summary to the issue-queue priority logic at
+  `perseus_ls_lrq.sv:L4068-L4080`.
+
+Both mechanisms share the same **design rationale** bullet in §3.3
+("age-primitive ordering vs FIFO pointer"): the reason the LRQ needs
+age-based ordering is independent of which cell implements it.
+Functional-equivalence of the two mechanisms under the LRQ's specific
+usage pattern, and the precise semantics of the "oldest" reducer wires,
+are deferred to §5 (Gate 13) and §8 (Gate 15).
+
+**(UNVERIFIED: §3.4 restates the Gate 11 snapshot observation
+(`LRQ-F53`); functional-equivalence between the `age_matrix(16)`
+spec-intent model and the 48+3 pairwise-comparator farm realised in RTL
+has not yet been proved in this document — forward reference to §5 and
+§8.)**
+
+---
+
+## §4 整体框图 (Block Diagram)
+
+> ASCII block diagram of the LRQ's top-level structure. Every block
+> carries an RTL line reference per rule R1. The **ordering primitive
+> block** is drawn as two parallel columns to honour the §3.4 framing
+> rule: the spec-intent column names the intended cell but is
+> annotated "not in this RTL snapshot"; the RTL-observed column names
+> the cells that are actually instantiated.
+
+### §4.1 Top-level block diagram
+
+```
+                                                                              ┌───────────────────────────────────────────────┐
+                                                                              │ Flush / precommit broadcast                   │
+                                                                              │   flush_v, flush_uid (pipe → entries)         │
+                                                                              │   precommit_uid_q (AGU → every entry)         │
+                                                                              │ Ref: perseus_ls_lrq.sv:L86                    │
+                                                                              │      perseus_ls_lrq_entry.sv:L163-L165        │
+                                                                              └─────────────────┬─────────────────────────────┘
+                                                                                                │ (broadcast to all 16 entries)
+                                                                                                ▼
+┌──────────────────────────┐     ┌──────────────────────────────────────────────────────────────────────────────────────────────┐
+│ 3-way allocation inputs  │     │                         16 × perseus_ls_lrq_entry  (10-state FSM each)                       │
+│  ls0_alloc, ls1_alloc,   │     │                                                                                              │
+│  ls2_alloc   (at d2)     │     │  u_lrq_entry_0  @ L13505    u_lrq_entry_1  @ L14006    u_lrq_entry_2  @ L14507                │
+│  older-than hints:       │     │  u_lrq_entry_3  @ L15008    u_lrq_entry_4  @ L15509    u_lrq_entry_5  @ L16010                │
+│   ls0_uop_older_than_    │────▶│  u_lrq_entry_6  @ L16511    u_lrq_entry_7  @ L17012    u_lrq_entry_8  @ L17513                │
+│   ls1_a1_q   (+ 2 more)  │     │  u_lrq_entry_9  @ L18014    u_lrq_entry_10 @ L18515    u_lrq_entry_11 @ L19016                │
+│  Ref: perseus_ls_lrq.sv  │     │  u_lrq_entry_12 @ L19517    u_lrq_entry_13 @ L20018    u_lrq_entry_14 @ L20519                │
+│       :L70-L72           │     │  u_lrq_entry_15 @ L21020                                                                     │
+└────────────┬─────────────┘     │                                                                                              │
+             │                   │  State flop: lrq_state_q[3:0]  (perseus_ls_lrq_entry.sv:L368)                                │
+             │ alloc-possible    │  casez next-state: perseus_ls_lrq_entry.sv:L2341-L2407                                       │
+             │ predicates        │                                                                                              │
+             │ lrq_alloc_        │  Per-entry side flops: entry_vld_q, lpt_wait_id_q[6:0], ld_linked_fb_rst_id_q[5:0],          │
+             │  possible_a{1,2}_ │                        ld_linked_fb_rst_id_unalign2_q, ld_big_endian_q, ld_accept_with_      │
+             │  {hi,lo}          │                        fast_byp_q, …                                                         │
+             │ (L1365-L1370)     │                                                                                              │
+             ▼                   └───┬─────────────────────────────┬─────────────────────────────┬────────────────────────────┘
+    ┌──────────────────────┐         │                             │                             │
+    │ Ordering primitive   │         │ per-entry "oldest" taps     │ linked-FB IDs               │ FSM status
+    │ (see two columns ▼)  │         │ lrq_entry_oldest_vld[15:0]  │ ld_linked_fb_rst_id_q,      │ ld_has_nc_dev_ld,
+    └──────────────────────┘         │ lrq_oldest_vld,             │ ld_has_linked_fb,           │ ld_accept_with_
+                                     │ lrq_overall_oldest_vld      │ clr_fb_link,                │ fast_byp_q,
+                                     │ (L1060, L3200, L3259)       │ clr_fb_link_unalign2        │ ld_page_split2_*,
+                                     ▼                             ▼                             ▼
+           ┌───────────────────────────────────────┬────────────────────────────────────────────────────────┐
+           │ Spec-intent column                    │ RTL-observed column                                    │
+           │ (not in this RTL snapshot)            │ (realised in perseus_ls_lrq.sv)                        │
+           ├───────────────────────────────────────┼────────────────────────────────────────────────────────┤
+           │ perseus_ls_age_matrix(AM_SIZE=16)     │ Pairwise age-compare farm:                             │
+           │   single cell holding the full        │   • 48 × perseus_ls_age_older_eq_compare               │
+           │   16-wide younger/older relation;     │       u_lrq_age_compare_ls{0,1,2}_alloc_entry{0..15}   │
+           │   one-cycle "oldest live entry"       │       perseus_ls_lrq.sv:L4636-L5012                    │
+           │   reducer per R1-R5 of spec §5.2.     │   • 3 × perseus_ls_age_compare                         │
+           │                                       │       u_lrq_age_compare_ls1_alloc_ls0_alloc,           │
+           │ Spec refs:                            │       u_lrq_age_compare_ls1_alloc_ls2_alloc,           │
+           │   docs/superpowers/specs/design_spec/ │       u_lrq_age_compare_ls2_alloc_ls0_alloc            │
+           │   2026-04-22-lsu-rtl-deep-dive-       │       perseus_ls_lrq.sv:L5026-L5038                    │
+           │   design.md:L154                      │                                                        │
+           │   design_docs/shared_primitives/      │ (UNVERIFIED bridge: functional-equivalence to the      │
+           │   ls_age_matrix.md:§1                 │  spec-intent column deferred to §5 / §8.)              │
+           └───────────────────────────────────────┴────────────────────────────────────────────────────────┘
+
+                       (per-entry FSM arcs out of the 16× block, drawn once)
+
+  ┌───────────────────────────────┐      ┌──────────────────────────────┐      ┌──────────────────────────────┐
+  │ d0 reissue arbitration        │      │ m3 / m4 L2-response demux    │      │ ls_fb coupling (MSHR-adjacent)│
+  │  disable_lrq0_pick_nxt,       │      │  l2_ls_spec_valid_m2         │      │  lrq_fb_ptr_q per entry,      │
+  │  disable_lrq1_pick_nxt        │      │    & ~lrq_has_nc_dev_ld      │      │  ld_linked_fb_rst_id_q[5:0],  │
+  │  lrq{0,1}_ld_won_arb_d1       │      │    → L2RESP_M3               │      │  ld_linked_fb_rst_id_         │
+  │                               │      │  l2_ls_spec_valid_m4_q       │      │    unalign2_q,                │
+  │  Ref: perseus_ls_lrq.sv:      │      │    & lrq_has_nc_dev_ld       │      │  ld_nc_dev_linked_fb_entry    │
+  │       L73-L74, L1283, L1358   │      │    → L2RESP_M4               │      │    [15:0],                    │
+  │                               │      │                              │      │  clr_fb_link,                 │
+  │ Output to ls_tag_data_arb:    │      │  Broadcast to iz:            │      │  clr_fb_link_unalign2         │
+  │  winning LRQ entry's op re-   │      │   ls_is_lrq_wakeup_iz        │      │                               │
+  │  enters pipe at d1            │      │   flop @ L3852-L3862         │      │  Ref: perseus_ls_lrq_entry.sv:│
+  │                               │      │                              │      │       L454-L463, L498-L499    │
+  └───────────────────────────────┘      │  Ref: perseus_ls_lrq.sv:     │      └──────────────────────────────┘
+                                         │       L3707, L3846-L3847     │
+                                         └──────────────────────────────┘
+
+  ┌───────────────────────────────┐      ┌──────────────────────────────┐      ┌──────────────────────────────┐
+  │ Livelock buster path          │      │ L2-response timeout          │      │ Queue-status exports          │
+  │  trigger_mid_range_livelock_  │      │  ls_lrq_timeout_tick_tock_   │      │  lrq_full (output L104),      │
+  │    buster                     │      │    change_q,                 │      │  lrq_avail_nxt_cnt[4:0]       │
+  │  → lrq_hazard_reset_vld       │      │  ls_tick_tock_q              │      │    (L1382-L1383, L29016),     │
+  │                               │      │  → set_first_tick_tock_      │      │  lrq_has_nc_dev_ld_q,         │
+  │  Ref: perseus_ls_lrq.sv:L90   │      │      change_seen →           │      │  lrq_has_nc_dev_ld_above_     │
+  │       perseus_ls_lrq_entry    │      │    set_lrq_entry_wait_       │      │    threshold_q,               │
+  │       .sv:L2314               │      │      l2resp_timeout          │      │  iq{0,1,2}_oldest_a1_mod      │
+  │                               │      │                              │      │                               │
+  │  Forces hazard-reset path     │      │  Ref: perseus_ls_lrq.sv:     │      │  Ref: perseus_ls_lrq.sv:      │
+  │  into FSM next-state logic    │      │       L65-L66                │      │       L104, L113,             │
+  │                               │      │       perseus_ls_lrq_entry.  │      │       L3228-L3229,            │
+  │                               │      │       sv:L2248-L2252         │      │       L4068-L4080             │
+  └───────────────────────────────┘      └──────────────────────────────┘      └──────────────────────────────┘
+```
+
+### §4.2 Block inventory (cross-reference table)
+
+| # | Block                              | Role                                                 | Primary RTL reference                                      |
+|---|------------------------------------|------------------------------------------------------|------------------------------------------------------------|
+| 1 | 3-way allocation inputs            | Three AGU pipes inject up to 3 alloc/cycle at `d2`   | `perseus_ls_lrq.sv:L70-L72, L1365-L1370`                   |
+| 2 | 16 × `perseus_ls_lrq_entry`        | Per-entry 10-state FSMs + side flops                 | `perseus_ls_lrq.sv:L13505, L14006, …, L21020` (16 sites); FSM `perseus_ls_lrq_entry.sv:L2341-L2407` |
+| 3 | Ordering primitive — spec-intent   | `age_matrix(16)` named by spec §5.2 / primitive doc  | Spec: `docs/superpowers/specs/design_spec/2026-04-22-lsu-rtl-deep-dive-design.md:L154`; primitive: `design_docs/shared_primitives/ls_age_matrix.md:§1, §7.1` — **not instantiated in this RTL snapshot** |
+| 4 | Ordering primitive — RTL-observed  | 48 × `age_older_eq_compare` + 3 × `age_compare`      | `perseus_ls_lrq.sv:L4636-L5012` (48 pairwise); `perseus_ls_lrq.sv:L5026-L5038` (3 cross-allocator) |
+| 5 | "Oldest" tap-outs                  | 16-bit + two scalar "oldest" reducers                | `perseus_ls_lrq.sv:L1060, L3200, L3259`; consumer at `L4068-L4080` |
+| 6 | d0 reissue arbitration             | LRQ vs fresh AGU competition at pipe `d0`            | `perseus_ls_lrq.sv:L73-L74, L1283, L1358`                   |
+| 7 | m3 / m4 L2-response demux          | Cacheable → `L2RESP_M3`; NC/dev → `L2RESP_M4`        | `perseus_ls_lrq.sv:L3707, L3846-L3847, L3852-L3862`         |
+| 8 | `ls_fb` coupling (MSHR-adjacent)   | Per-entry linked-FB IDs + clear paths                | `perseus_ls_lrq_entry.sv:L454-L463, L498-L499`              |
+| 9 | Flush / precommit broadcast        | `flush_v` / `flush_uid` / `precommit_uid_q` fan-out  | `perseus_ls_lrq.sv:L86`; `perseus_ls_lrq_entry.sv:L163-L165, L512-L513` |
+| 10 | Livelock buster path              | `trigger_mid_range_livelock_buster` → hazard reset   | `perseus_ls_lrq.sv:L90`; `perseus_ls_lrq_entry.sv:L2314`    |
+| 11 | L2-response timeout detect         | `tick_tock_change_q` two-edged timer                 | `perseus_ls_lrq.sv:L65-L66`; `perseus_ls_lrq_entry.sv:L2248-L2252` |
+| 12 | Queue-status exports               | `lrq_full`, `lrq_avail_nxt_cnt`, NC/dev trackers     | `perseus_ls_lrq.sv:L104, L113, L3228-L3229, L1382-L1383, L29016` |
+
+### §4.3 Diagram caveats
+
+- The 16 per-entry FSM arcs (to/from d0-arb, m3/m4 demux, FB coupling,
+  flush, livelock, timeout, status) are drawn once at the bottom of the
+  diagram rather than 16 times, to keep the figure legible. Each of the
+  16 entries has its own copy of these connections — the FSM is
+  genuinely per-entry, not centralised.
+- The ordering-primitive block is the one place where this diagram
+  *deliberately* shows two realisations side by side. Later sections
+  (§5 Gate 13, §8 Gate 15) will discuss whether the two are
+  functionally equivalent under the LRQ's usage; at the abstraction
+  level of §3/§4 they are drawn as parallel alternatives per the pilot
+  framing rule.
+- `lrq_fb_ptr_q` is used as a shorthand in the FB-coupling block for
+  the family `ld_linked_fb_rst_id_q` / `ld_linked_fb_rst_id_unalign2_q`
+  / `ld_nc_dev_linked_fb_entry`; the exact per-entry pointer-vs-vector
+  shape is detailed in §6 (Gate 13).
+
+---
+
+<!-- §5 onwards deferred to Tasks 14-18 (Gates 13-17). Do not fill here. -->
