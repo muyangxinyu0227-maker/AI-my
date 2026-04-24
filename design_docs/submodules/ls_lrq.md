@@ -2284,3 +2284,484 @@ argument above.)*
   would need its own gate or lose the power-down advantage.
 
 ---
+
+## §9 FSM — `lrq_state_q` 10-state machine
+
+This section documents the per-entry lifecycle FSM that lives in
+`perseus_ls_lrq_entry.sv`. Each LRQ entry owns an independent
+instance; the 16 instances operate in parallel. The FSM is the
+single authority on "what the entry is waiting for" and gates all
+entry-level outputs (`ld_nc_dev_wakeup`, `lrq_in_pipe_state`,
+`lrq_wait_on_lpt`, …).
+
+**Source pointers.**
+
+- State encoding: `perseus_ls_defines.sv:L724-L734` (4-bit field
+  `PERSEUS_LS_LRQ_STATE = [3:0]`).
+- Next-state combinational: `perseus_ls_lrq_entry.sv:L2339-L2412`
+  — single `always_comb: u_lrq_state_din_3_0` with a 63-row
+  `casez` on a 23-bit selector (19 trigger bits + 4 current-state
+  bits).
+- State flop: `perseus_ls_lrq_entry.sv:L2420-L2435` —
+  `always_ff: u_lrq_state_q_3_0`, reset→`4'b0000` (RDY), enable
+  `lrq_state_en = alloc_spec | alloc_pa | entry_vld_q`
+  (`perseus_ls_lrq_entry.sv:L2417`).
+- Flush/kill hook: `perseus_ls_lrq_entry.sv:L1592` builds
+  `flush_lrq_entry`, which flows into `lrq_entry_clr`
+  (`perseus_ls_lrq_entry.sv:L1624`) and drops `entry_vld_q`
+  (`perseus_ls_lrq_entry.sv:L1551`). Abort does **not** directly
+  force `lrq_state_q`; instead it invalidates the entry, and the
+  next `alloc_spec` to the same slot re-initialises state from
+  reset (or the state flop simply stops updating because
+  `lrq_state_en` is deasserted). See §9.3 note on "flush abort".
+
+*(Spec-intent: perseus_rtl.md §5.1 "Lifecycle is a 10-state FSM"
++ §7 R7 "lifecycle waveform"; Gate 11 verified the 4-bit encoding
+against `perseus_ls_defines.sv` with no rename.)*
+
+---
+
+### §9.1 State encoding — 10 states in 4-bit field
+
+| 编码 (4-bit) | 状态名 | 含义 (Semantic) | RTL 引用 |
+|:---:|:---|:---|:---|
+| `4'b0000` | **RDY** | Idle — entry invalid, waiting for `alloc_spec` | `perseus_ls_defines.sv:L725` |
+| `4'b0001` | **IN_PIPE** | Load is cycling D1-D4 pipe (fresh alloc / replay / wake-up) | `perseus_ls_defines.sv:L726` |
+| `4'b0010` | **WAIT_L2RESP** | L1 miss issued, parked waiting for L2/BIU fill | `perseus_ls_defines.sv:L727` |
+| `4'b0011` | **WAIT_STDATA** | STD-to-LD forwarding required; waiting for older store data | `perseus_ls_defines.sv:L728` |
+| `4'b0100` | **WAIT_OLD_PRECOMMIT** | NC/device or page-split2-NC load; stalled until older uops precommit | `perseus_ls_defines.sv:L730` |
+| `4'b0101` | **L2RESP_M3** | L2 resp has landed at M3 stage; 1-cycle transient before M4 | `perseus_ls_defines.sv:L731` |
+| `4'b0110` | **L2RESP_M4** | L2 resp at M4; fast-byp may consume it or kick back to WAIT_L2RESP | `perseus_ls_defines.sv:L732` |
+| `4'b0111` | **STDATA_SPEC_WKUP** | Speculative STD wake-up fired; waiting for non-spec confirm or replay | `perseus_ls_defines.sv:L729` |
+| `4'b1000` | **WAIT_LPT** | Held at alloc because LPT resource busy; released when LPT frees | `perseus_ls_defines.sv:L733` |
+| `4'b1001` | **WAIT_FB** | L1 miss merged with an in-flight fill-buffer; waits for FB wake-up | `perseus_ls_defines.sv:L734` |
+
+Encoding is sparse (6 unused codes out of 16). Note that the
+numeric order is **not** lifecycle order — `WAIT_OLD_PRECOMMIT=4`
+precedes `L2RESP_M3=5` in the codespace but is reached via a
+different branch; `STDATA_SPEC_WKUP=7` is inserted between
+`L2RESP_M4=6` and `WAIT_LPT=8` for no observable reason. See §9.2
+for logical flow.
+
+Reset (`reset_i==1'b1`) forces `lrq_state_q <= 4'b0000` (=RDY) —
+`perseus_ls_lrq_entry.sv:L2423`.
+
+---
+
+### §9.2 Transition graph — full ASCII
+
+```
+                                alloc_spec & ld_nc_dev/page_split2_nc
+                                       (row 2, any state)
+                          ┌────────────────────────────────────────────┐
+                          │                                            │
+                          ▼                                            │
+              ┌──────────────────────┐  ld_cancel_l1_miss_wakeup_m4    │
+              │ WAIT_OLD_PRECOMMIT   │──────────────────────────┐      │
+              │       (0100)         │  (row 51)                │      │
+              └──────────┬───────────┘                          │      │
+                         │ ld_nc_dev_wakeup=1                   │      │
+                         │ (row 51)                             │      │
+                         ▼                                      ▼      │
+   alloc_spec=0 & won_arb=0 & wait_lpt=0               ┌─────────────┐ │
+   (row 3, idle-loop)                                  │    RDY      │◄┴─── reset_i=1
+                          ┌────────────────────────────┤   (0000)    │     (L2423)
+                          │                            └──────┬──────┘
+                          │                                   │
+                          │            alloc_spec=1 &         │  (row 1, non-spec drop:
+                          │            ld_d1_override_or_d4_respin=1   alloc_spec & ~nc_dev
+                          │            (row 4 — fresh alloc)           & ~won_arb & ~wait_lpt)
+                          │                                   │
+                          │                                   ▼
+                          │          alloc_spec=1 &   ┌───────────────┐
+                          │       won_arb=1 & wait_lpt=0  (row 5)    │
+                          │                           │   IN_PIPE     │
+                          │          ┌──────────────► │    (0001)     │◄────────┐
+                          │          │                └──┬──┬──┬──┬───┘         │
+                          │          │        m2_crit=1  │  │  │  │             │
+                          │          │        (row 15)   │  │  │  │             │
+                          │          │                   │  │  │  │             │
+                          │          │                   │  │  │  └── waiting_on_stdata_d3=1
+                          │          │                   │  │  │      (rows 18-19) → WAIT_STDATA
+                          │          │                   │  │  │
+                          │          │     d1_over/d4_respin=0, │                │
+                          │          │     m2_crit=0 (row 16)   │                │
+                          │          │      self-loop            │                │
+                          │          │                           │                │
+                          │          │     l1_miss_wait_for_l2=1 │                │
+                          │          │     & ~d1_over (row 29)   ▼                │
+                          │          │                   ┌───────────────┐        │
+                          │          │                   │  WAIT_L2RESP  │        │
+                          │          │                   │    (0010)     │        │
+                          │          │                   └───┬───┬───────┘        │
+                          │          │  fast_byp_accept=1    │   │                │
+                          │          │  & m2_crit=0          │   │  l2_crit=1     │
+                          │          │  (row 44)             │   │ (row 30/52)    │
+                          │          │   ◄───────────────────┘   │                │
+                          │          │                           ▼                │
+                          │          │                   ┌───────────────┐        │
+                          │          │  d4_respin=1      │  L2RESP_M3    │        │
+                          │          │  (row 11)         │    (0101)     │────────┘ (m3→IN_PIPE)
+                          │          │  ◄────────────────┤               │
+                          │          │                   └──┬────┬───────┘
+                          │          │                      │    │ default (row 55)
+                          │          │       nc_dev_wkup=1  │    ▼
+                          │          │       (row 56)       │  ┌───────────────┐
+                          │          │       → RDY          │  │  L2RESP_M4    │
+                          │          │                      │  │    (0110)     │
+                          │          │                      │  └──┬──┬──┬──────┘
+                          │          │                      │     │  │  │ fast_byp_q=0
+                          │          │                      │     │  │  │ (row 57/58) → RDY
+                          │          │                      │     │  │  │
+                          │          │   ld_accept_fast_byp=1   │  │  └──► IN_PIPE (rows 12-13)
+                          │          │   (row 12 L2RESP_M4 →     │  │
+                          │          │    IN_PIPE)               │  │  m2_noncrit=1
+                          │          │                           │  │  (row 59)
+                          │          │                           │  │  → L2RESP_M3
+                          │          │                           │  │
+                          │          │                           │  │  default if cancel_l1_miss=1
+                          │          │                           │  │  (rows 60-61) → WAIT_L2RESP
+                          │          │                           │  │
+                          │          │   waiting_on_stdata_d3=1  │  │
+                          │          │   (rows 25-27:            │  │
+                          │          │    L2RESP_M3/M4/WAIT_L2   │  │
+                          │          │    → WAIT_STDATA)         │  │
+                          │          │                           │  │
+                          │          │     ┌─────────────────────┘  │
+                          │          │     │                        │
+                          │          │     ▼                        │
+                          │          │  ┌─────────────────┐         │
+                          │          └──┤  WAIT_STDATA    │         │
+                          │  std_spec  │     (0011)       │         │
+                          │  _wkup=1   └─┬────────┬───┬───┘         │
+                          │  (row 32)    │        │   │ std_non_spec│
+                          │  →STDATA_    │ d4_re- │   │ _wkup=1     │
+                          │   SPEC_WKUP  │ spin=1 │   │ (row 33)    │
+                          │              │ (row 31│   │ → RDY       │
+                          │              │  →IN_  │   │             │
+                          │              │  PIPE) │   │             │
+                          │              ▼        ▼   ▼             │
+                          │        ┌─────────────────┐              │
+                          │        │STDATA_SPEC_WKUP │              │
+                          │        │     (0111)      │              │
+                          │        └─┬──┬──┬──┬──────┘              │
+                          │          │  │  │  │                     │
+                          │          │  │  │  │ d4_respin=1         │
+                          │          │  │  │  │ (row 36)→ IN_PIPE   │
+                          │          │  │  │  │                     │
+                          │          │  │  │  │ std_non_spec=1      │
+                          │          │  │  │  │ (row 37)→ RDY       │
+                          │          │  │  │  │                     │
+                          │          │  │  │  │ std_spec=1          │
+                          │          │  │  │  │ (row 38) self-loop  │
+                          │          │  │  │  │                     │
+                          │          │  │  │  │ no-wkup(row 39)     │
+                          │          │  │  │  │ → WAIT_STDATA       │
+                          │          │  │  │  │                     │
+                          │          │  │  │  │ fb_wkup=1(row 40)   │
+                          │          │  │  │  │ → RDY               │
+                          │          │  │  │  └─────────────────────┘
+                          │          │  │  │
+                          │          │  │  └─ IN_PIPE: l1_miss_wait_on_fb_d3=1
+                          │          │  │     (rows 20-23) → WAIT_FB
+                          │          │  │
+                          │          │  │   ┌──────────────────┐
+                          │          │  │   │     WAIT_FB      │
+                          │          │  │   │     (1001)       │
+                          │          │  │   └──┬────┬──┬───────┘
+                          │          │  │      │    │  │ fb_wkup=1 & cancel=0
+                          │          │  │      │    │  │ (rows 42-43) → IN_PIPE/RDY
+                          │          │  │      │    │  │
+                          │          │  │      │    │  │ fb_wkup=1 → RDY (row 43)
+                          │          │  │      │    │  │
+                          │          │  │      │    │  │ linked_fb_but_no_fb_match_d3
+                          │          │  │      │    │  │ (row 41) → WAIT_FB self
+                          │          │  │      └────┴──┘
+                          │          │  │
+                          │          │  │   alloc_spec=1 & won_arb=1 & wait_lpt=1
+                          │          │  │   (row 6, fresh alloc, LPT busy)
+                          │          │  │            │
+                          │          │  │            ▼
+                          │          │  │    ┌──────────────────┐
+                          │          │  │    │     WAIT_LPT     │
+                          │          │  │    │     (1000)       │
+                          │          │  │    └──┬────────┬──────┘
+                          │          │  │       │        │ lpt_wakeup_final=1
+                          │          │  │       │        │ (row 50) → RDY
+                          │          │  │       │        │
+                          │          │  │       │        │ no wkup (row 49) self-loop
+                          │          │  │       └────────┘
+                          │          │  │
+                          │          └──┴── IN_PIPE→RDY cases (rows 14,16-17): non-miss
+                          │                 completion, m2_noncrit wakeup, cancel.
+                          │
+                          └── flush_v & uid-in-kill-range ⇒ flush_lrq_entry=1
+                              (L1592) ⇒ entry_vld_q cleared (L1551) ⇒
+                              lrq_state_en deasserted next cycle ⇒
+                              state_q HOLDS until next alloc, which then
+                              re-enters the FSM from RDY (reset path or via
+                              row 3 idle-loop when alloc_spec rearrives).
+```
+
+**Arrow count (labelled transitions in §9.2):** 26 distinct
+source→target transitions depicted (self-loops counted once per
+source). The full case-row enumeration (§9.3) includes 60 casez
+rows that map onto these 26 edges (multiple rows can collapse onto
+a single source/target pair because the RTL encodes trigger
+priority via row order, not edge multiplicity).
+
+---
+
+### §9.3 Transition trigger table
+
+One row per distinct logical edge. Trigger names use the exact
+RTL signal identifiers from the selector concatenation at
+`perseus_ls_lrq_entry.sv:L2341`. The 23-bit selector breaks down
+as (MSB→LSB, grouped by `_` delimiters in the `casez` patterns):
+
+```
+[22:19] alloc_spec, ld_type_nc_dev_alloc_or_page_split2_nc,
+        ld_won_arb_at_alloc, lrq_ld_wait_on_lpt_alloc
+[18:16] ld_alloc_fast_byp_accept_dly_vld, ld_accept_with_fast_byp_q,
+        ld_d1_override_or_d4_respin
+[15:13] ld_waiting_on_stdata_d3, ld_miss_l1_wait_for_l2resp,
+        lrq_ld_l1_miss_wait_on_fb_d3
+[12:6]  ls_ld_std_spec_wakeup_final, ls_ld_std_non_spec_wakeup_final,
+        ls_ld_fb_wakeup_final,
+        ld_l1_miss_wakeup_m2_crit_or_clr_false_l2_wait_final,
+        ld_l1_miss_wakeup_m2_noncrit,
+        ld_nc_dev_wakeup, lpt_wakeup_final
+[5]     ld_cancel_l1_miss_wakeup_m4
+[4]     linked_fb_but_no_fb_match_d3
+[3:0]   lrq_state_q  (current state, 4-bit)
+```
+
+| # | 源状态 | 目标状态 | 触发条件 (RTL signals) | RTL 行 (casez row) | 备注 |
+|:---:|:---|:---|:---|:---:|:---|
+| 1 | **any** | RDY | `alloc_spec=1 & nc_dev=0 & won_arb=0 & wait_lpt=0` | `L2342` | Alloc attempt but not won, non-precommit — drop |
+| 2 | **any** | WAIT_OLD_PRECOMMIT | `ld_type_nc_dev_alloc_or_page_split2_nc=1` (alloc or in-flight) | `L2343` | NC/device or page-split2-NC — stall for older-precommit |
+| 3 | RDY | RDY | `alloc_spec=0 & nc_dev=0` (idle hold) | `L2344` | Empty-entry self-loop |
+| 4 | **any** | IN_PIPE | `alloc_spec=0 & nc_dev=0 & d1_override_or_d4_respin=1` | `L2345` | D1/D4 respin injects entry back into pipe |
+| 5 | **any** | IN_PIPE | `alloc_spec=1 & nc_dev=0 & won_arb=1 & wait_lpt=0` | `L2346` | Fresh alloc wins arb, LPT free |
+| 6 | **any** | WAIT_LPT | `alloc_spec=1 & nc_dev=0 & wait_lpt=1` | `L2347` | Fresh alloc blocked by LPT resource |
+| 7 | RDY | IN_PIPE | `fast_byp_accept_dly_vld=1 & fast_byp_q=0` | `L2348` | Alloc with fast-bypass accept replay |
+| 8 | RDY | RDY | `fast_byp_accept=1 & fast_byp_q=1` (duplicate accept) | `L2349` | Fast-byp already consumed — drop |
+| 9 | RDY | WAIT_L2RESP | `fast_byp_accept=1 & d1_override_or_d4_respin=1` | `L2350` | Alloc routed directly to L1-miss wait |
+| 10 | RDY | RDY | `fast_byp=0 & waiting_on_stdata_d3=1` | `L2351` | Idle-alloc dropped due to STD dependency check |
+| 11 | RDY | L2RESP_M3 | `fast_byp=0 & miss_l1_wait_for_l2resp=1 & m2_crit=1` | `L2352` | Fast-path to M3 (critical L2 response already latched) |
+| 12 | L2RESP_M3 | IN_PIPE | `fast_byp_accept=1 & d1/d4_respin=1` | `L2353` | M3 kicks load back into pipe for bypass replay |
+| 13 | L2RESP_M4 | IN_PIPE | `fast_byp_accept=1 & fast_byp_q=0` | `L2354` | M4 hands off; fast-byp consumed |
+| 14 | L2RESP_M4 | WAIT_L2RESP | `fast_byp_accept=1 & fast_byp_q=1` | `L2355` | M4 duplicate — re-park for fresh L2 |
+| 15 | IN_PIPE | RDY | `fast_byp=0 & miss_l1_wait=0 & m2_crit=0 & m2_noncrit=0` & end-markers | `L2356` | Non-miss hit completes in pipe |
+| 16 | IN_PIPE | IN_PIPE | `fast_byp=0 & miss_l1_wait=0 & no-wakeup` | `L2357` | Pipe self-loop (multi-cycle within D1-D4) |
+| 17 | IN_PIPE | RDY | `fast_byp=0 & waiting_on_stdata_d3=0 & cancel` patterns | `L2358` | Pipe completes, L1-miss cancelled |
+| 18 | IN_PIPE | WAIT_STDATA | `waiting_on_stdata_d3=1 & fast_byp=0` (MSB trigger) | `L2359` | STD-to-LD forwarding required |
+| 19 | IN_PIPE | WAIT_STDATA | `waiting_on_stdata_d3=1 & fast_byp=1` | `L2360` | Same trigger, fast-byp concurrent |
+| 20 | IN_PIPE | WAIT_FB | `lrq_ld_l1_miss_wait_on_fb_d3=1 & fast_byp=0` | `L2361` | L1 miss merges to fill-buffer |
+| 21 | IN_PIPE | WAIT_FB | `lrq_ld_l1_miss_wait_on_fb_d3=1 & fast_byp=1` | `L2362` | FB-merge with fast-byp parallel |
+| 22 | IN_PIPE | WAIT_FB | Variant pattern (wait_for_l2=0, wait_on_fb=1) | `L2363` | FB-merge with l2-wait=0 |
+| 23 | IN_PIPE | WAIT_FB | Variant with fast_byp pattern bits set | `L2364` | FB-merge alternate alloc pattern |
+| 24 | L2RESP_M3 | WAIT_STDATA | `waiting_on_stdata_d3=1 & fast_byp=0` | `L2365` | Late STD dep detected post-L2 |
+| 25 | L2RESP_M4 | WAIT_STDATA | same pattern, M4 source | `L2366` | Same as 24 from M4 |
+| 26 | WAIT_L2RESP | WAIT_STDATA | `waiting_on_stdata_d3=1 & l1_miss_wait=1` | `L2367` | Parked L1-miss discovers STD dep |
+| 27 | WAIT_L2RESP | WAIT_FB | `l1_miss_wait_on_fb_d3=1` (FB covers this miss) | `L2368` | L1 miss merges onto in-flight FB |
+| 28 | IN_PIPE | WAIT_L2RESP | `ld_miss_l1_wait_for_l2resp=1` | `L2369` | Standard L1-miss park |
+| 29 | IN_PIPE | L2RESP_M3 | `m2_crit_or_clr_false_l2_wait_final=1` | `L2370` | L2 response arrived while still in-pipe |
+| 30 | WAIT_STDATA | IN_PIPE | `d1_override_or_d4_respin=1` | `L2371` | STD resolved via D4 respin |
+| 31 | WAIT_STDATA | RDY | `fast_byp=1 & d1/d4_respin=1` | `L2372` | STD resolved with concurrent fast-byp → drop (edge) |
+| 32 | WAIT_STDATA | WAIT_STDATA | no wake-up (`std_spec=0 & std_non_spec=0`) | `L2373` | Idle wait-loop |
+| 33 | WAIT_STDATA | STDATA_SPEC_WKUP | `ls_ld_std_spec_wakeup_final=1` | `L2374` | Speculative STD wake-up |
+| 34 | WAIT_STDATA | RDY | `ls_ld_std_non_spec_wakeup_final=1` | `L2375` | Non-spec STD wake-up → complete |
+| 35 | STDATA_SPEC_WKUP | IN_PIPE | `d1/d4_respin=1` | `L2376` | Spec wake replay enters pipe |
+| 36 | STDATA_SPEC_WKUP | RDY | `fast_byp=1 & d1/d4_respin=1` | `L2377` | Spec wake with fast-byp → drop |
+| 37 | STDATA_SPEC_WKUP | STDATA_SPEC_WKUP | `std_spec=1` self-refresh | `L2378` | Spec wake repeats (no respin yet) |
+| 38 | STDATA_SPEC_WKUP | WAIT_STDATA | no wake-up (`std_spec=0 & std_non_spec=0`) | `L2379` | Spec wake lapsed — return to wait |
+| 39 | STDATA_SPEC_WKUP | RDY | `ls_ld_std_non_spec_wakeup_final=1` | `L2380` | Non-spec wake confirms |
+| 40 | WAIT_FB | WAIT_FB | no wake-up (`fb_wkup=0`) | `L2381` | FB-merge self-loop |
+| 41 | WAIT_FB | IN_PIPE | `fb_wkup=1 & d1/d4_respin=1` | `L2382` | FB wake replays into pipe |
+| 42 | WAIT_FB | RDY | `fb_wkup=1 & fast_byp=1` | `L2383` | FB wake + fast-byp → drop (completed) |
+| 43 | WAIT_FB | RDY | `fb_wkup=1` (end-marker) | `L2384` | FB wake terminates load |
+| 44 | WAIT_L2RESP | IN_PIPE | `fast_byp_accept=1 & m2_crit=0` | `L2385` | L2 resp consumed via fast-byp replay |
+| 45 | WAIT_L2RESP | WAIT_L2RESP | `fast_byp_accept=1 & m2_crit=1` | `L2386` | L2 resp race — hold |
+| 46 | WAIT_L2RESP | WAIT_L2RESP | no wake-up | `L2387` | L1-miss idle-loop |
+| 47 | WAIT_L2RESP | RDY | `lrq_ld_l1_miss_wait_on_fb_d3=0 & cancel_l1_miss_wakeup_m4=1` | `L2388` | L1-miss cancelled at M4 |
+| 48 | WAIT_L2RESP | RDY | `m2_noncrit=1` | `L2389` | Non-critical wake completes load |
+| 49 | WAIT_L2RESP | L2RESP_M3 | `m2_crit=1` | `L2390` | Critical L2 wake advances to M3 |
+| 50 | WAIT_OLD_PRECOMMIT | WAIT_OLD_PRECOMMIT | no wake-up | `L2391` | Precommit-stall self-loop |
+| 51 | WAIT_OLD_PRECOMMIT | RDY | `ld_nc_dev_wakeup=1` | `L2392` | All older uops precommitted → release |
+| 52 | WAIT_LPT | WAIT_LPT | no wake-up | `L2393` | LPT-stall self-loop |
+| 53 | WAIT_LPT | RDY | `lpt_wakeup_final=1` | `L2394` | LPT freed |
+| 54 | L2RESP_M3 | L2RESP_M3 | `m2_crit=1 & cancel=0` | `L2395` | M3 hold while m2_crit latches |
+| 55 | L2RESP_M3 | L2RESP_M3 | `m2_noncrit=1 & cancel=0` | `L2396` | M3 hold on noncrit wake |
+| 56 | L2RESP_M3 | L2RESP_M4 | default M3 advance | `L2397` | Natural M3→M4 progression |
+| 57 | L2RESP_M3 | RDY | `cancel_l1_miss_wakeup_m4=1` | `L2398` | M3 aborted by late cancel |
+| 58 | L2RESP_M4 | RDY | `cancel_l1_miss_wakeup_m4=0` (end) | `L2399` | M4 completes, load done |
+| 59 | L2RESP_M4 | RDY | alt pattern `m2_noncrit=1, cancel=0` | `L2400` | M4 finish via noncrit path |
+| 60 | L2RESP_M4 | L2RESP_M3 | `m2_noncrit=1 & cancel_l1_miss_wakeup_m4=1` | `L2401` | M4 bounces back to M3 on cancel |
+| 61 | L2RESP_M4 | WAIT_L2RESP | `cancel=1 & fb_wkup=0` | `L2402` | M4 cancelled — re-park |
+| 62 | L2RESP_M4 | WAIT_L2RESP | alt variant | `L2403` | Same as 61, different alloc bits |
+| — | **any** | (HOLD) | `flush_v=1 & uid∈kill-range` ⇒ `flush_lrq_entry=1` | `L1592,L1624,L1551` | **Flush abort**: clears `entry_vld_q`; `lrq_state_en` deasserts next cycle; state flop holds, re-initialised via reset path at next `alloc_spec`. See §9.4-D. |
+| — | **any** | RDY | `reset_i=1` | `L2423` | Async reset |
+
+Total RTL case-rows: **62** explicit + 1 default-x + 1 flush side-path + 1 reset = **62 explicit casez transitions** (per `perseus_ls_lrq_entry.sv:L2342-L2403`), mapping onto 26 distinct state→state edges in §9.2.
+
+*(Note — trigger-column shorthand: "`fast_byp`" = `ld_alloc_fast_byp_accept_dly_vld`; "`fast_byp_q`" = `ld_accept_with_fast_byp_q`; "`m2_crit`" = `ld_l1_miss_wakeup_m2_crit_or_clr_false_l2_wait_final`; "`m2_noncrit`" = `ld_l1_miss_wakeup_m2_noncrit`; "`d1/d4_respin`" = `ld_d1_override_or_d4_respin`; "`cancel`" = `ld_cancel_l1_miss_wakeup_m4`. Full names are in the selector decomposition above.)*
+
+---
+
+### §9.4 Typical lifecycle waveforms
+
+Each waveform shows `state_q` on one row plus the driving
+trigger(s) on signal rows beneath. Cycles are labelled C0…Cn; all
+signals sampled at rising-edge clk. State value shown is
+`state_q[3:0]` at that cycle's sampling point.
+
+#### §9.4.A — Normal L1-miss flow: RDY → IN_PIPE → WAIT_L2RESP → L2RESP_M3 → L2RESP_M4 → RDY
+
+Scenario: cacheable load, L1 miss, L2 returns with normal (non-critical-fast) timing, no STD dep, no FB merge.
+
+```
+                   C0    C1    C2    C3    C4    C5    C6    C7
+                  ─────┬─────┬─────┬─────┬─────┬─────┬─────┬─────
+state_q           RDY  │IN_PI│IN_PI│WT_L2│WT_L2│M3   │M4   │RDY
+(binary)          0000 │0001 │0001 │0010 │0010 │0101 │0110 │0000
+                  ─────┴─────┴─────┴─────┴─────┴─────┴─────┴─────
+alloc_spec         _/‾‾\_______________________________________
+ld_won_arb         _/‾‾\_______________________________________
+ld_miss_l1_wait_    ________/‾‾‾‾‾‾‾‾‾‾‾\_____________________
+  for_l2resp
+m2_crit            _________________________/‾‾\______________
+(L2 critical wake)
+(default M3→M4)    ______________________________/‾‾\_________
+cancel_l1_miss     ___________________________________________
+  _wakeup_m4        (always 0)
+```
+
+Walk-through:
+
+- **C0**: entry idle at RDY. `alloc_spec=1 & won_arb=1 & wait_lpt=0 & nc_dev=0` latches row 5 (L2346).
+- **C1**: state becomes IN_PIPE (0001). Load cycles through D1-D2-D3.
+- **C2**: still IN_PIPE (row 16 self-loop L2357 — no wake-up, no completion trigger yet). At D3, `ld_miss_l1_wait_for_l2resp` asserts.
+- **C3**: transition IN_PIPE→WAIT_L2RESP via row 28 (L2369).
+- **C4**: WAIT_L2RESP self-loop (row 46 L2387) — still waiting.
+- **C5**: `m2_crit=1` (critical L2 wake arrives). Row 49 (L2390) transitions to L2RESP_M3.
+- **C6**: default row 56 (L2397) advances to L2RESP_M4.
+- **C7**: default row 58 (L2399, cancel=0) — load complete → RDY.
+
+Matches spec §7 R7 "normal-flow lifetime ≈ 7 cycles L2-bound".
+
+#### §9.4.B — Speculative STD wake path: RDY → IN_PIPE → WAIT_STDATA → STDATA_SPEC_WKUP → RDY
+
+Scenario: load forwards from an older store whose data is not yet in the STB; speculative wake fires, is confirmed non-speculatively, load retires.
+
+```
+                   C0    C1    C2    C3    C4    C5    C6
+                  ─────┬─────┬─────┬─────┬─────┬─────┬─────
+state_q           RDY  │IN_PI│WT_ST│WT_ST│SPEC_│SPEC_│RDY
+(binary)          0000 │0001 │0011 │0011 │0111 │0111 │0000
+                  ─────┴─────┴─────┴─────┴─────┴─────┴─────
+alloc_spec         _/‾‾\_______________________________
+ld_waiting_on_     ________/‾‾‾‾‾‾‾‾‾‾‾\_______________
+  stdata_d3
+std_spec_wkup      ____________________/‾‾\____________
+  _final
+std_non_spec       ________________________/‾‾\________
+  _wkup_final
+```
+
+Walk-through:
+
+- **C0→C1**: RDY → IN_PIPE via row 5 (L2346).
+- **C2**: `waiting_on_stdata_d3=1` at D3 → row 18 (L2359) WAIT_STDATA.
+- **C3**: no wake-up → row 32 (L2373) WAIT_STDATA self-loop.
+- **C4**: `ls_ld_std_spec_wakeup_final=1` → row 33 (L2374) STDATA_SPEC_WKUP.
+- **C5**: spec-wakeup persists without replay — row 37 (L2378) self-refresh.
+- **C6**: `ls_ld_std_non_spec_wakeup_final=1` → row 39 (L2380) RDY. Load completes as non-speculatively-validated.
+
+Alternative exit: row 35 (L2376) `d1/d4_respin=1` → IN_PIPE (replays the load to consume the forwarded data).
+
+#### §9.4.C — Precommit-gated NC/device flow: RDY → WAIT_OLD_PRECOMMIT → RDY
+
+Scenario: device-memory or page-split2-NC load allocated with older uops still in ROB (`ld_type_nc_dev_alloc_or_page_split2_nc=1`). Must drain older uops before accessing device.
+
+```
+                   C0    C1    C2    C3    C4    C5
+                  ─────┬─────┬─────┬─────┬─────┬─────
+state_q           RDY  │OLD_ │OLD_ │OLD_ │OLD_ │RDY
+                      │PREC │PREC │PREC │PREC │
+(binary)          0000 │0100 │0100 │0100 │0100 │0000
+                  ─────┴─────┴─────┴─────┴─────┴─────
+alloc_spec         _/‾‾\______________________________
+ld_type_nc_dev_    _/‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾\_______
+  alloc_or_page_
+  split2_nc
+ld_nc_dev_wakeup   _________________________/‾‾\_____
+  (from L2202:
+   driven when
+   older uops
+   precommit)
+```
+
+Walk-through:
+
+- **C0→C1**: `alloc_spec=1` with `nc_dev_alloc_or_page_split2_nc=1` — row 2 (L2343) → WAIT_OLD_PRECOMMIT. Note this priority row fires **regardless** of current state (hence "(any)→WAIT_OLD_PRECOMMIT" in §9.2).
+- **C2-C4**: row 50 (L2391) WAIT_OLD_PRECOMMIT self-loop; older precommit not yet complete.
+- **C5**: older uop precommits → `ld_nc_dev_wakeup=1` (driven by L2202 combinational). Row 51 (L2392) → RDY.
+- **Follow-up (not shown)**: subsequent cycle sees alloc/replay that re-enters the FSM via row 4 or 5 to actually execute the device access as IN_PIPE.
+
+#### §9.4.D — Flush abort: any mid-state → (entry_vld cleared) → next-alloc RDY
+
+Scenario: load is mid-lifecycle (e.g., waiting in WAIT_L2RESP) when branch mispredict / exception flush hits. The uop is in the kill range.
+
+```
+                   C0    C1    C2    C3    C4    C5
+                  ─────┬─────┬─────┬─────┬─────┬─────
+state_q           WT_L2│WT_L2│WT_L2│(hold)(hold)RDY (via
+                      │     │     │(no en)(no en)  new alloc)
+(binary)          0010 │0010 │0010 │0010 │0010 │0000
+                  ─────┴─────┴─────┴─────┴─────┴─────
+flush_v            _________/‾‾\___________________________
+uid_in_kill_       _________/‾‾\___________________________
+  range
+flush_lrq_entry    _________/‾‾\___________________________
+  (L1592)
+entry_vld_q        ‾‾‾‾‾‾‾‾‾‾\_________________________
+  (cleared next cycle via lrq_entry_clr L1624)
+lrq_state_en       ‾‾‾‾‾‾‾‾‾‾‾\________________________
+  (=alloc_spec|alloc_pa|entry_vld_q;  deasserts)
+alloc_spec         _______________________________/‾‾\____
+  (next alloc)
+```
+
+Walk-through:
+
+- **C0-C1**: entry in WAIT_L2RESP, nothing unusual.
+- **C2**: `flush_v=1` and this uop's UID falls in the kill range → `flush_lrq_entry=1` (L1592).
+- **C3**: `lrq_entry_clr` asserted (L1624), `entry_vld_q` drops to 0 at C3 edge (L1551). `lrq_state_en` becomes 0 because `alloc_spec=0 & alloc_pa=0 & entry_vld_q=0`.
+- **C3-C4**: `lrq_state_q` **holds its old value** (WAIT_L2RESP=`0010`) because the flop enable is deasserted (see state flop L2425 `else if (lrq_state_en==1)`; no else-clause). The held value is **irrelevant** — all downstream uses are gated by `entry_vld_q` (e.g., `lrq_wait_on_l2_resp` at L1881 is `entry_vld_q & (state_q==WAIT_L2RESP) & ...`).
+- **C5**: new `alloc_spec=1` to this entry → `lrq_state_en=1` again, row 5 or other alloc-path writes a fresh state. Because the FSM is stateful only via `entry_vld_q`, the stale state is overwritten atomically.
+- **Reset alternative**: if `reset_i=1` at any point, `state_q` is forced to `4'b0000` (RDY) directly (L2423).
+
+**Key finding (flush abort — UNVERIFIED-§9.4D).** The FSM does **not** include explicit flush-to-RDY edges in the `casez`. Abort semantics come from (i) `entry_vld_q` clearing (which gates all state-dependent outputs) plus (ii) the clock-enable deasserting. This means that between the flush cycle and the next alloc, `lrq_state_q` retains its pre-flush value in the physical flop — a purely-stale latch that has no observable effect because `entry_vld_q=0`. If a future design change ever reads `state_q` without `entry_vld_q` qualification, this becomes a bug. **UNVERIFIED**: whether any downstream consumer reads `state_q` unqualified — not yet surveyed across the full LSU RTL for this pilot.
+
+---
+
+### §9.5 Spec-intent vs RTL snapshot deltas
+
+| Aspect | Spec intent (`perseus_rtl.md §5.1`) | RTL snapshot (MP128-r0p3-00rel0-2) | Delta |
+|:---|:---|:---|:---|
+| State count | "10-state FSM" | 10 encodings used (`0,1,2,3,4,5,6,7,8,9`) | Match |
+| State encoding | "4-bit field" | `PERSEUS_LS_LRQ_STATE = [3:0]` | Match |
+| Lifecycle order | RDY → IN_PIPE → (wait) → (resp) → RDY | Confirmed via §9.4.A waveform | Match |
+| Flush semantics | "any → RDY" in spec prose | RTL: flush clears `entry_vld_q`; state flop holds stale until next alloc (see §9.4.D) | **Spec simplification**; physically equivalent because downstream uses are `entry_vld_q`-gated, but literal "→ RDY" is a spec abstraction, not an RTL edge |
+| Encoding numeric order | Not specified | Non-sequential (WAIT_OLD_PRECOMMIT=4 before L2RESP_M3=5; STDATA_SPEC_WKUP=7 between L2RESP_M4=6 and WAIT_LPT=8) | Cosmetic; no spec claim |
+| STDATA sub-states | Spec: "speculative STD wake" as one state | RTL: 2 states (WAIT_STDATA, STDATA_SPEC_WKUP) | RTL more granular — spec is abstracted |
+
+No blocking deltas.
+
+---
+
+**UNVERIFIED introduced in §9:**
+- §9.4D: whether any downstream consumer reads `lrq_state_q` without `entry_vld_q` qualification (would make the stale-flop-after-flush observable).
+
+---
