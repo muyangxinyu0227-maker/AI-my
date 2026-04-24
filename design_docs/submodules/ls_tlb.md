@@ -1,7 +1,7 @@
 # L2 Module: `perseus_ls_tlb` — 44-entry L1 Data micro-TLB
 
-> Scope of this document in the current pilot gate: **§1 (Module Role) + §2 (Features) + §3 (Microarchitectural Abstraction) + §4 (Block Diagram)**.
-> §5–§14 will be authored in Tasks 9–11 (Gates 8–10). Do not read later sections here — they do not yet exist.
+> Scope of this document in the current pilot gate: **§1 (Module Role) + §2 (Features) + §3 (Microarchitectural Abstraction) + §4 (Block Diagram) + §5 (Port List) + §6 (Important-Timing Waveforms)**.
+> §7–§14 will be authored in Tasks 10–11 (Gates 9–10). Do not read later sections here — they do not yet exist.
 
 **Source file under analysis.**
 - Path: `perseus/logical/perseus_loadstore/verilog/perseus_ls_tlb.sv`
@@ -367,5 +367,614 @@ Framing: one block diagram, with the replacement region showing **two parallel b
 
 ---
 
-*End of §3–§4. §5–§14 will be authored in Tasks 9–11 (Gates 8–10).*
+## §5 接口列表 (Port List)
+
+Framing rule for this section: per Task 7 step 3, the module has **757 port-declaration lines** (`grep -cE '^\s*(input|output|inout)\s+' perseus_ls_tlb.sv` = 757). This exceeds the 100-port threshold in the Gate-8 plan guidance, so the section is organised as **functional-domain subtables**. Each subtable uses the columns requested by the plan: **信号 | 位宽 | 源/目的模块 | 活跃阶段 | 作用**. Source/destination is inferred from signal-name prefix per the pilot convention (`cur_*`/`tcr_*`/`scr_*`/`pstate_*` → system-register / CPU context; `ls_mm_*` → outbound to MMU (`ls_mm`); `mm_ls_*` → inbound from MMU; `snp_*` → Snoop/TMO; `agu_*` → AGU; `is_*` / `issue_v_*` → Issue; `spe_*` → SPE profiler; `tbe_*` → TRBE; `pmu_*` → PMU; `cb_dft*` / `chka_*` → DFT; `pf_*` → prefetcher; `sb_*` → SAB; `ct_*` → context-track / commit-track; `flush*` → Flush network). Active stage is read off the `_i2` / `_a1` / `_a2` / `_a3` / `_d2` / `_d3` / `_t4` / `_m6` suffixes; unsuffixed signals are treated as **static / configuration** (sampled once or held across many cycles).
+
+Line numbers in the 源/目的 column's witness reference the `perseus_ls_tlb.sv` RTL under inspection (MP128-r0p3-00rel0). Where a signal has no stage suffix, the 活跃阶段 column reads **static** rather than a pipeline letter.
+
+`(UNVERIFIED: per-bit widths that expand from `PERSEUS_*` macros (e.g. `PERSEUS_UID`, `PERSEUS_LS_PA`, `PERSEUS_LS_TLBID`, `PERSEUS_TLB_PERM_INFO_RANGE`) are carried as the macro name — numeric expansion is deferred to Gate 9 §8 key-circuit walkthrough, consistent with the R5 disposition established in §1.4 / §3.5.)`
+
+### §5.1 Inputs (by functional domain)
+
+#### §5.1.1 Clock / Reset / DFT (L32–L36)
+
+| 信号 | 位宽 | 源模块 | 活跃阶段 | 作用 |
+|------|------|--------|----------|------|
+| `clk` | 1 | LSU top-level clock tree | continuous | Module clock. |
+| `reset_i` | 1 | LSU reset network | async | Active-high asynchronous reset for all flops. |
+| `cb_dftramhold` | 1 | DFT controller (`cb_`) | static (test mode) | DFT RAM-hold; freezes entry-flop updates during scan/MBIST. |
+| `cb_dftcgen` | 1 | DFT controller | static (test mode) | DFT clock-gen enable — forces clock gaters transparent. |
+| `chka_disable_ls_rcg` | 1 | Check / DFT path | static | Disables LS RCG (root clock gating) for debug / ATPG. |
+
+#### §5.1.2 CPU context / System registers (L39–L96, L900–L906)
+
+| 信号 | 位宽 | 源模块 | 活跃阶段 | 作用 |
+|------|------|--------|----------|------|
+| `cur_mmuon` | 1 | CPU context | static | MMU-enabled indicator (selects translated vs flat mode). |
+| `cur_vmon` | 1 | CPU context | static | Virtualisation-enabled indicator (Stage-2 relevance). |
+| `cur_usr` | 1 | CPU context | static | Current-EL is EL0 (unprivileged) indicator. |
+| `cur_asid_el1` / `cur_asid_el2` / `cur_asid` | 16 each | CPU context | static | Current ASID per EL and effective ASID for CAM tag match. |
+| `cur_vmid` | 16 | CPU context | static | Current VMID (Stage-2 / nested translation tag). |
+| `c_bit` | 1 | CPU context | static | Current `C` flag (secure/non-secure translation). |
+| `ct_sample_sys_or_pstate_dly` / `ct_sample_sys_dly_q` / `ct_sample_pstate` / `ct_sample_pstate_dly_q` | 1 each | Context-track (`ct_`) | static (sample-window) | Commit-track sample pulses/delays for sys-reg / PSTATE re-sampling of TLB context. |
+| `cur_hyp` | 1 | CPU context | static | Current-EL is EL2 (hypervisor) indicator. |
+| `cpsr_aarch32` | 1 | CPU context | static | PSTATE AArch32 vs AArch64 selector. |
+| `cur_msid` | 3 | CPU context | static | Current Memory-Space-ID (used by snoop-TMO match and miss-req payload). |
+| `ls_dev_reorder_disable` | 1 | LS control | static | Disable device-memory reorder (gates dev-early outputs). |
+| `eff_hcr_e2h` / `at_s1op_as_ipa` / `raw_e2h` / `hcr_tge` | 1 each | CPU context | static | HCR-derived effective flags for nested / E2H translations. |
+| `vmid_size_16bits` | 1 | CPU context | static | VMID width selector (16 vs 8 bits) — TLB-F10. |
+| `tcr_el1_as` / `tcr_el2_as` | 1 each | CPU context | static | TCR ASID-size selector per EL. |
+| `ls_disable_va_frc_range_flt` | 1 | LS control | static | Disables VA-range fault forcing (debug / bring-up). |
+| `eff_hcr_nv` / `eff_hcr_nv1` | 1 each | CPU context | static | NV1/NV hyp-virt bits (nested-virt translation class). |
+| `scr_el3_eel2_q` / `scr_el3_ns_q` | 1 each | CPU context | static | SCR_EL3 effective-EL2 / NS bits. |
+| `eff_pstate_pan` | 1 | CPU context | static | Effective PSTATE.PAN (TLB-F15). |
+| `pstate_uao` | 1 | CPU context | static | PSTATE.UAO (TLB-F16). |
+| `m_bit_secure_el01` / `m_bit_el3` / `m_bit_hyp` / `m_bit_nonsec_el01` | 1 each | CPU context | static | Per-EL M-bit (MMU-enable) fanout. |
+| `cpsr_el` | 2 | CPU context | static | Current EL encoding. |
+| `ls_64_tick_tock_change_q` / `ls_512_tick_tock_change_q` | 1 each | LS timer / watermark | static | Coarse timers for prefetch / age aging. |
+| `lsN_ld_pf_hit_count_sat_fb_a1_q` (N=0,1,2) | 1 each | LS prefetcher | a1 | LD prefetch hit-count saturated (per pipe). |
+| `ls_mm_idle_sys_req` | 1 | `ls_mm` | static | MMU is in idle/system-req mode — suppresses new miss submission (seen in `L11371` miss-valid gate). |
+| `tcr_tcma{0,1}_el{1,2,3}` | 1 each (×6) | CPU context | static | TCMA (Tag-Check-Bypass) per TTBR/EL — TLB-F18. |
+| `pstate_tco` | 1 | CPU context | static | PSTATE.TCO (MTE tag-check override). |
+| `prec_mte_va_uid_q` / `prec_mte_uid_vld_q` | `PERSEUS_UID` / 1 | Precommit (MTE) | static (held) | Precommit MTE uid + valid (MTE UID gating, TLB-F34). |
+| `tcr_tbi{0,1}_el{1,2,3}` | 1 each (×6) | CPU context | static | TBI (Top-Byte-Ignore) per TTBR/EL — TLB-F17. |
+| `c_bit_ns_el1` / `c_bit_ns_el1_s1` / `c_bit_aarch64_el3` / `c_bit_s_el1` / `c_bit_hyp_el2` | 1 each | CPU context | static | Per-EL/context `C` bits for translation-output attribute path. |
+| `force_nc_s2_el1_0_raw` / `force_nc_s2_el1_0` | 1 each | CPU context | static | Force non-cacheable on Stage-2 for EL1/0 (debug/config). |
+
+#### §5.1.3 HD / Stage-2 / Fault-decoder inputs (L107–L113, L908–L916)
+
+| 信号 | 位宽 | 源模块 | 活跃阶段 | 作用 |
+|------|------|--------|----------|------|
+| `stg1_hd_el1` / `stg1_hd_el2` / `stg1_hd_el3` / `stg2_hd` | 1 each | CPU context (HD update) | static | HW Access/Dirty update enable per stage/EL — TLB-F11/F12. |
+| `tcr_nfd0` / `tcr_nfd1` | 1 each | CPU context | static | TCR.NFDx (non-fault debug) selectors. |
+| `fault_status_lsN_a2` (N=0,1,2) | `PERSEUS_PFLT_INFO_FS` | LS fault encoder | a2 | Per-pipe fault-status input (feeds SPE/TRBE buffer flt outputs). |
+| `prc_abort_hyp_lsN_a2` (N=0,1,2) | 1 each | LS abort/Hyp trap | a2 | Hyp-abort indicator used by permission/htrap outputs. |
+| `spe_owning_el2` / `spe_owning_ns` | 1 each | SPE | static | SPE buffer owning EL/NS qualifier. |
+| `tbe_owning_el2` / `tbe_owning_ns` / `trblimitr_el1_nvm_q` / `ls_chsw_disable_tbe_replay` | 1 each | TRBE | static | TRBE ownership + chsw-disable (TRBE buffer path). |
+
+#### §5.1.4 LOR descriptors (L115–L130)
+
+| 信号 | 位宽 | 源模块 | 活跃阶段 | 作用 |
+|------|------|--------|----------|------|
+| `lor_descK_v` (K=0..3) | 1 each | CPU context (LOR table) | static | Valid bit for LOR descriptor K (TLB-F29). |
+| `lor_descK_sa_q` / `lor_descK_ea_q` (K=0..3) | `PERSEUS_LS_PA_MAX:16` each | CPU context | static | Start/End address of LOR region K. |
+| `lor_descK_n_q` (K=0..3) | `PERSEUS_LS_LOR_ID` each | CPU context | static | LOR region id. |
+
+#### §5.1.5 Snoop / TLBI (TMO) interface (L134–L145)
+
+| 信号 | 位宽 | 源模块 | 活跃阶段 | 作用 |
+|------|------|--------|----------|------|
+| `snp_tmo_va_valid` | 1 | Snoop / TLBI agent | i2 | TLB maintenance operation valid — triggers context-match precompute (TLB-F24, L1927–L1935). |
+| `snp_tmo_vmid` / `snp_tmo_vmid_valid` | 16 / 1 | Snoop | i2 | TMO VMID qualifier + valid. |
+| `snp_tmo_asid` / `snp_tmo_asid_valid` | 16 / 1 | Snoop | i2 | TMO ASID qualifier + valid. |
+| `snp_tmo_sec` | 1 | Snoop | i2 | TMO secure/non-secure qualifier. |
+| `snp_tmo_el` | 2 | Snoop | i2 | TMO target-EL qualifier. |
+| `snp_tmo_stage` | 2 | Snoop | i2 | TMO translation-stage qualifier (S1/S2). |
+| `snoop_stall_tbw_req_a1` | 1 | Snoop | a1 | Snoop stalls TBW request (drives `tbw_busy`). |
+| `snoop_sync_inv_tlb_i2` | 1 | Snoop | i2 | Sync-invalidate pulse (TLB-F25). |
+
+#### §5.1.6 MMU wakeup / cross-cycle hints (L148)
+
+| 信号 | 位宽 | 源模块 | 活跃阶段 | 作用 |
+|------|------|--------|----------|------|
+| `early_mm_wakeup_m6_q` | 1 | `ls_mm` (MMU) | m6 | Early MMU-wakeup hint used as clock-enable for pending-miss flops (TLB-F37). |
+
+#### §5.1.7 Per-pipeline Issue / i2 hand-off (L151–L202) — three pipes
+
+Block repeated **three times** (`_ls0_i2`, `_ls1_i2`, `_ls2_i2`). Rows listed once with `N∈{0,1,2}`:
+
+| 信号 | 位宽 | 源模块 | 活跃阶段 | 作用 |
+|------|------|--------|----------|------|
+| `lsN_uop_older_than_ls1_i2` (N=0 only, L151) | 1 | LS age-matrix feed | i2 | Pre-age relation between ls0 and ls1 at i2. |
+| `unalign2_lsN_i2` | 1 | LS pipeline | i2 | Second-access of an unaligned split detected at i2. |
+| `ls_uop_ctl_lsN_i2_q` | `PERSEUS_LS_CTL` | Issue | i2 | Full control-bundle of the i2 uop. |
+| `issue_v_lsN_i2_q` / `issue_v_lsN_i2` | 1 / 1 | Issue | i2 | Issue-valid (flopped / raw). |
+| `uid_lsN_i2_q` | `PERSEUS_UID` | Issue | i2 | uop-id. |
+| `rid_lsN_i2_q` | 1 | Issue | i2 | Retire-id bit. |
+| `instr_id_lsN_i2_q` | 64 | Issue | i2 | Full instruction ID for debug/perf. |
+| `lsN_st_pf_on_rst_full_a1_q` | 1 | LS prefetcher | a1 | ST prefetch reset-full indicator (carried through). |
+| `tmo_inject_val_lsN_i2` | 1 | TMO / LSU-arb | i2 | TLB-maintenance op injection valid at i2. |
+| `address_inject_val_lsN_i2_q` | 1 | LS inject path | i2 | Address-inject valid (debug/replay). |
+| `pf_tlb_inject_v_lsN_i2` | 1 | Prefetcher | i2 | Prefetcher-initiated TLB lookup inject valid. |
+
+#### §5.1.8 Per-pipeline a1 VA / AGU / control (L209–L263, L490–L505, L574–L589, L658–L673) — three pipes
+
+Again repeated for N∈{0,1,2}:
+
+| 信号 | 位宽 | 源模块 | 活跃阶段 | 作用 |
+|------|------|--------|----------|------|
+| `agu_addend_a_lsN_a1_q` / `agu_addend_b_lsN_a1_q` | 64 each | AGU | a1 | VA final-adder carry-save operands. |
+| `carry_in_lsN_a1_q` | 1 | AGU | a1 | VA final-adder carry-in. |
+| `lsN_fast_cout11_a1` | 1 | AGU | a1 | Fast carry-out at bit 11 (page-offset boundary). |
+| `lsN_uop_flush_a1` | 1 | Flush net | a1 | Flush the a1 uop. |
+| `unalign1_lsN_a1` | 1 | LS unalign detect | a1 | First-access of an unaligned split at a1. |
+| `reject_unalign_lsN_a1` | 1 | LS unalign detect | a1 | Unalign-reject input. |
+| `tlb_cam_v_ld_st_ccpass_lsN_a1` | 1 | LS arb | a1 | TLB CAM-valid qualifier (LD/ST/ccpass). |
+| `tlb_cam_v_lsN_a1` / `va_v_lsN_a1` | 1 / 1 | LS arb | a1 | CAM-valid and VA-valid enables. |
+| `ld_val_lsN_a1` / `st_val_lsN_a1` | 1 each | LS arb | a1 | LD/ST valid class. |
+| `ls_uop_ctl_lsN_a1_q` | `PERSEUS_LS_CTL` | Issue (flopped) | a1 | uop control bundle at a1. |
+| `ccpass_lsN_a1` | 1 | LS predicate | a1 | Conditional-compare pass. |
+| `lsN_ccpass_a2_q` | 1 | LS predicate | a2 | ccpass flopped to a2. |
+| `lsN_pred_inv_force_ccfail_a1` | 1 | LS predicate | a1 | Predicate-invalid forces ccfail. |
+| `ff_gather_ld_lsN_a2` / `nf_ld_lsN_a2` | 1 each | SVE gather | a2 | SVE gather/non-fault LD qualifiers. |
+| `ffr_lane_eq_first_active_lane_lsN_a2` / `first_vld_lane_found_lsN_a2` | 1 each | SVE predicate | a2 | SVE FFR / first-active-lane indicators. |
+| `st_no_xlat_lsN_a1` | 1 | LS arb | a1 | ST-without-translation (no-xlat) bypass. |
+| `mmuoff_ps_flt_lsN_a1` | 1 | LS fault encoder | a1 | MMU-off page-size fault. |
+| `dcivac_lsN_a1` / `ls_pld_lsN_a1` / `tmo_lsN_a1` / `cxp_lsN_a1` / `par_wr_lsN_a1` | 1 each | LS decode | a1 | DCI-VAC / PLD / TMO / CXP / PAR-WR op class flags. |
+| `tmo_inject_val_lsN_a1_q` | 1 | Inject / TMO | a1 | TMO inject valid at a1. |
+| `lsN_page_split2_a1_q` / `lsN_page_split1_val_a1` | 1 each | LS unalign | a1 | Page-split accesses. |
+| `lsN_wr_a1` / `lsN_pldw_a1` | 1 each | LS decode | a1 | Write / PLDW class. |
+| `lsN_precommit_uop_a1_q` | 1 | Precommit | a1 | Precommit-uop hand-off at a1 (TLB-F33). |
+| `lsN_op_pass_older_st_pend_nuke_a1` | 1 | LS SAB | a1 | Nuke older-pending-ST class. |
+| `lsN_frc_unchecked_a1_q` | 1 | LS control | a1 | Force-unchecked MTE flag. |
+| `address_inject_val_lsN_a1_q` | 1 | Inject | a1 | Address-inject valid at a1. |
+
+#### §5.1.9 Per-pipeline a2 stage-handoff (L423–L448, L503–L532, L587–L616, L671–L700, L865–L887, L970–L988) — three pipes
+
+| 信号 | 位宽 | 源模块 | 活跃阶段 | 作用 |
+|------|------|--------|----------|------|
+| `mte_ata_en_lsN_a2_q` / `mte_prc_mode_lsN_a2` / `mte_imprc_mode_lsN_a2` | 1 each | MTE control | a2 | MTE ATA-enable / precise / imprecise modes. |
+| `prc_abort_b4_xlat_lsN_a2` | 1 | LS abort | a2 | Pre-translation precise-abort. |
+| `st_accept_lsN_a2` / `st_reject_lsN_a2` / `ld_accept_lsN_a2` / `ld_reject_lsN_a2` | 1 each | LS arb | a2 | LD/ST accept/reject at a2 (also a3 variants at L762–L773). |
+| `unalign2_lsN_a1_q` / `unalign2_lsN_a2_q` | 1 each | LS unalign | a1/a2 | Unalign-2 carried. |
+| `lsN_abort_early_indicator_adjusted_a2` | 1 | LS abort | a2 | Adjusted early-abort indicator. |
+| `tmo_inject_val_lsN_a2_q` | 1 | Inject | a2 | TMO inject at a2. |
+| `lsN_page_split2_a2_q` | 1 | LS unalign | a2 | Page-split carried to a2. |
+| `st_val_lsN_a2_q` / `ld_val_lsN_a2_q` | 1 each | LS arb | a2 | Validity at a2 (flopped). |
+| `ls_pld_lsN_a2` | 1 | LS decode | a2 | PLD at a2. |
+| `force_wbtr_lsN_a2_q` | 1 | LS force-write-back-transient | a2 | Force WBTR indicator. |
+| `lsN_va_frc_range_flt_a2_q` | 1 | LS VA-range flt | a2 | VA-range fault asserted. |
+| `atomic_op_lsN_a2` / `lsN_pldw_a2` / `lsN_wr_a2_q` / `dcivac_lsN_a2` / `cmo_rd_lsN_a2` | 1 each | LS decode | a2 | Op-class carried to a2. |
+| `issue_v_lsN_a2_q` | 1 | Issue | a2 | Issue-valid at a2 (flopped from a1). |
+| `address_inject_val_lsN_a2_q` | 1 | Inject | a2 | Address-inject at a2. |
+| `ls_ct_rslv_v_ld_lsN` / `ls_ct_rslv_uid_ld_lsN` | 1 / `PERSEUS_UID` each | Commit-track | static (resolve-window) | Commit-track LD-resolve valid + uid. |
+| `lsN_prc_abort_adjusted_a2` | 1 | LS abort | a2 | Precise-abort adjusted at a2. |
+| `nc_dev_unalign_flt_poss_lsN_a2_q` | 1 | LS fault encoder | a2 | NC-device unalign-fault-possible indicator. |
+| `spe_inject_val_lsN_i2` / `_a1_q` / `_a2_q` | 1 each (×3 stages) | SPE | i2 / a1 / a2 | SPE-inject valid carried through stages. |
+| `lsN_match_spe_uid_a1` / `_a2_q` | 1 each | SPE | a1 / a2 | SPE-uid match per pipe. |
+| `lsN_tbw_abort_replay_adjusted_a2` | 1 | TBW | a2 | Table-walker abort-replay adjusted. |
+| `tbe_inject_val_lsN_i2` / `_a1_q` / `_a2_q` | 1 each (×3 stages) | TRBE | i2 / a1 / a2 | TRBE-inject valid carried. |
+
+#### §5.1.10 MMU response capture (L800–L810)
+
+| 信号 | 位宽 | 源模块 | 活跃阶段 | 作用 |
+|------|------|--------|----------|------|
+| `flush` | 1 | Flush net | static (pulse) | Global flush pulse. |
+| `flush_uid` | `PERSEUS_UID` | Flush net | static (pulse) | Flush target uid. |
+| `mm_ls_tlb_miss_resp_v` | 1 | `ls_mm` (MMU) | response cycle | MMU-walk response valid (TLB-F04). |
+| `mm_ls_tlb_miss_resp_id` | 2 | `ls_mm` | response cycle | 2-bit outstanding-slot id (4 outstanding, TLB-F05). |
+| `mm_ls_tlb_miss_resp_flt` | 1 | `ls_mm` | response cycle | Fault indicator on response. |
+| `mm_ls_tlb_miss_resp_pa` | `[48:12]` | `ls_mm` | response cycle | Translated PA. |
+| `mm_ls_tlb_miss_resp_attr` | `PERSEUS_TBW_RESP_ATTR_RANGE` | `ls_mm` | response cycle | Response attributes (memattr/SH/AP/...). |
+| `mm_ls_tlb_miss_resp_va` | `[PERSEUS_LS_VA_MAX:25]` | `ls_mm` | response cycle | Upper-VA returned by walker. |
+| `mm_ls_tlb_miss_resp_replay` | 1 | `ls_mm` | response cycle | Walker requests replay (TLB-F43). |
+
+#### §5.1.11 DFT / MBIST / Debug-RAM read (L812–L815, L821)
+
+| 信号 | 位宽 | 源模块 | 活跃阶段 | 作用 |
+|------|------|--------|----------|------|
+| `snp_dbg_ram_rd_valid_d0` | 1 | Snoop / debug | d0 | Debug-RAM read valid. |
+| `snp_dbg_ram_rd_target_d0` | `PERSEUS_LS_DEBUG_RD_ENC_RANGE` | Snoop / debug | d0 | Debug-read target encoding. |
+| `snp_lookup_va_d0` | `PERSEUS_LS_L1_TLB_DBG_RD_IDX_BITS` | Snoop / debug | d0 | Debug lookup VA/index (TLB-F39). |
+| `snp_dbg_ram_rd_ns_d2` | 1 | Snoop / debug | d2 | NS attribute for debug read. |
+| `precommit_uid_q` | `PERSEUS_UID` | Precommit | static | Precommit-uid for outstanding-entry flush compares (TLB-F36). |
+
+#### §5.1.12 Prefetcher-TLB inject + SAB AT-saved (L828–L862)
+
+| 信号 | 位宽 | 源模块 | 活跃阶段 | 作用 |
+|------|------|--------|----------|------|
+| `pf_tlb_inject_v_lsN_a1` / `_a2` (N=0,1,2) | 1 each (×6) | Prefetcher | a1 / a2 | Prefetch-triggered TLB-inject valid per pipe/stage. |
+| `pf_tlb_lookup_injected_id_a2_q` | `PERSEUS_LS_PF_GT_TLB_ID_R` | Prefetcher | a2 | Prefetch-lookup injected transaction id. |
+| `sb_at_use_saved_info_v_q` / `sb_at_tlb_saved_q` / `sb_clr_tlb_saved_info` | 1 each | SAB (AT state) | static (held) | SAB "AT-op saved info" handshake inputs. |
+| `flush_at_saved` | 1 | SAB / Flush | static (pulse) | Flush the AT-saved state. |
+
+#### §5.1.13 Miscellaneous (L950, L970–L988)
+
+| 信号 | 位宽 | 源模块 | 活跃阶段 | 作用 |
+|------|------|--------|----------|------|
+| `ls_spe_buffer_done` | 1 | SPE | static | SPE buffer drained indicator. |
+| `ls_chsw_disable_spe_replay` | 1 | SPE | static | Disable SPE-replay path (chip-select-wide). |
+
+**§5.1 summary: 13 input subgroups.**
+
+### §5.2 Outputs (by functional domain)
+
+#### §5.2.1 Per-pipeline a1 VA-formation outputs (L213–L224, L283–L294, L353–L364) — three pipes
+
+For N∈{0,1,2}:
+
+| 信号 | 位宽 | 目的模块 | 活跃阶段 | 作用 |
+|------|------|----------|----------|------|
+| `lsN_cin_a1` | 64 | AGU / DCache / LRQ | a1 | Carry-in term re-broadcast (fanout for final-adder). |
+| `va_lsN_a1` | 64 | DCache / LRQ / SAB | a1 | Fully-formed VA for downstream consumers (TLB-F01). |
+| `p_lsN_a1` | `PERSEUS_LS_VA_MAX:32` | AGU / DCache | a1 | Propagate term of the final-adder. |
+| `g_lsN_a1` | `PERSEUS_LS_VA_MAX-1:32` | AGU / DCache | a1 | Generate term of the final-adder. |
+| `lsN_cout31_a1` | 1 | AGU / DCache | a1 | Carry-out at bit 31 (4-GB boundary indicator). |
+| `va_hi_upper_byte_allones_lsN_a1` / `_allzeroes_lsN_a1` | 1 each | LS fault encoder | a1 | VA-high upper-byte = all-1s / all-0s pre-check (TLB-F21). |
+| `va_hi_55_to_va_max_allones_lsN_a1` / `_allzeroes_lsN_a1` | 1 each | LS fault encoder | a1 | VA[55:MAX] = all-1s / all-0s pre-check. |
+| `va_larger_than_pa_max_lsN_a1` | 1 | LS fault encoder | a1 | VA > PA_MAX pre-check. |
+
+#### §5.2.2 Per-pipeline a2 translation result (L451–L488, L535–L572, L619–L656) — three pipes
+
+| 信号 | 位宽 | 目的模块 | 活跃阶段 | 作用 |
+|------|------|----------|----------|------|
+| `tlb_any_hit_lsN_a2` | 1 | DCache / LRQ / SAB | a2 | Any-entry hit for pipe N (TLB-F01, `L451`). |
+| `tlb_one_or_more_hits_lsN_a2` | 1 | LS fault / multi-hit | a2 | ≥1 entry hit (pre multi-hit arbitration). |
+| `tlb_hit_conflict_raw_lsN_a2` / `tlb_hit_conflict_lsN_a2` | 1 each | LS fault | a2 | Raw / gated hit-conflict (coalesced multi-hit, TLB-F23). |
+| `ld_tlb_hit_a1_eq_wr_vec_lsN_a2_q` | 1 | LRQ / SAB | a2 | LD-hit-equals-pending-WR vector flopped. |
+| `lsN_pa_a2` / `lsN_fb_pa_a2` / `lsN_st_pa_a2` | `PERSEUS_LS_PA` each | DCache / FB / STB | a2 | Translated PA (main / fillbuf / store variants). |
+| `lsN_sb_pa_a2` | `PERSEUS_LS_PA_MAX:12` | STB | a2 | PA for store-buffer index. |
+| `lsN_fb_va_a2_q` | `PERSEUS_LS_VA_MAX:PERSEUS_LS_VA_ALIAS_MSB+1` | Fillbuf | a2 | VA alias-MSB for fillbuf. |
+| `fb_tlb_cam_v_lsN_a1` / `fb_va_v_lsN_a1` | 1 each | Fillbuf | a1 | Fillbuf CAM/VA-valid. |
+| `ns_lsN_a2` | 1 | Attribute network | a2 | Non-secure attribute. |
+| `outer_alloc_lsN_a2` / `outer_alloc_pre_lsN_a2` | 1 each | L2 / allocator | a2 | Outer-alloc attribute (& pre-select). |
+| `cache_attr_lsN_a2` | `PERSEUS_LSL2_CACHE_ATTR` | L2 / DCache | a2 | Cacheability attribute. |
+| `page_attr_lsN_a2` | `PERSEUS_LS_PAGE_ATTR_SAVE` | LS fault encoder | a2 | Page attribute save. |
+| `tlb_dev_htrap_lsN_a2` | 1 | LS fault encoder | a2 | Device-memory hyp-trap (TLB-F14). |
+| `tlb_fwb_override_lsN_a2_q` | 1 | L2 | a2 | FWB override flop. |
+| `mte_access_lsN_a2` / `mte_access_stg_lsN_a2` / `mte_allow_flt_lsN_a2` | 1 each | MTE | a2 | MTE-access decode (TLB-F19). |
+| `ldg_frc_raz_lsN_a2` | 1 | MTE | a2 | LDG-force-read-as-zero. |
+| `lsN_mte_ttbr_a2` | 1 | MTE | a2 | MTE TTBR selector (0/1). |
+| `stg_raw_lsN_a2` | 1 | LS STB | a2 | Store-group RAW hazard to this translation. |
+| `lsN_l1pf_ctag_a2` | 1 | L1 prefetcher | a2 | L1PF-ctag drive. |
+| `spe_mte_access_ldg_stg_dcg_lsN_a2` | 1 | SPE / MTE | a2 | SPE-MTE access combined (TLB-F28). |
+| `permission_lsN_a2` | `PERSEUS_TLB_PERM_INFO_RANGE` | LS abort / fault encoder | a2 | Permission bundle (TLB-F13). |
+| `dbm_bits_lsN_a2` | `PERSEUS_TLB_DBM_BITS_RANGE` | LS HD-update | a2 | DBM bits for HD-dirty update. |
+| `tlb_xlat_levels_lsN_a2` | `PERSEUS_TLB_XLAT_LVLS_RANGE` | LS fault encoder | a2 | Translation-level vector. |
+| `tlbid_lsN_a2_q` / `tlbid_lsN_dup_a2_q` | `PERSEUS_LS_TLBID` each | LRQ / SAB (fanout) | a2 | Which-entry-hit (TLB-F08). |
+| `share_attr_lsN_a2` | `PERSEUS_TLB_SH_ATTR_RANGE` | L2 | a2 | Shareability attribute. |
+| `ps_lsN_a2` | `PERSEUS_LS_L1_TLB_PS` | DCache / LS | a2 | Page-size code (TLB-F07). |
+| `lor_match_lsN_a2` / `lor_id_lsN_a2` | 1 / `PERSEUS_LS_LOR_ID` | LS ordering | a2 | LOR match / id (TLB-F29). |
+| `pbha_lsN_a2` | `PERSEUS_PBHA_RANGE` | L2 | a2 | PBHA hint bits. |
+| `nc_dev_early_lsN_a2` | 1 | LS L2IF | a2 | NC-device early indicator. |
+| `lsN_ldgm_ld_a1` / `lsN_ldg_ld_a1` | 1 each | MTE | a1 | LDG/LDGM LD class. |
+| `lsN_ltag_a2_q` | 4 | MTE | a2 | Logical-tag carried to a2. |
+| `lsN_cl_adr_ops_a2_q` | 1 | L2 | a2 | Cacheline-address-op class. |
+| `lsN_type_stgm_ldgm_a2` | 1 | MTE | a2 | STGM/LDGM class. |
+| `lsN_at_op_a2_q` | 1 | SAB (AT) | a2 | AT-op class at a2. |
+| `cur_msid_lsN_a2_q` | 3 | Attribute network | a2 | MSID carried to a2. |
+| `reject_unalign_lsN_a2_q` | 1 | LS fault | a2 | Unalign-reject flopped to a2. |
+| `lsN_precommit_uop_a2_q` | 1 | Precommit | a2 | Precommit carried. |
+| `lsN_type_ldpx_a2_q` | 1 | LS decode | a2 | LDPX class carried. |
+| `at_op_lsN_a1` | 1 | SAB (AT) | a1 | AT-op indicator at a1. |
+| `xlat_unpriv_lsN_a1` / `xlat_unpriv_lsN_a2_q` | 1 each | LS arb | a1 / a2 | Unprivileged translation (LDTR/STTR, TLB-F20). |
+| `valid_xlat_uop_lsN_a1` / `valid_xlat_uop_lsN_a2` | 1 each | LS arb | a1 / a2 | Valid translation uop. |
+| `xlat_tgt_m_bit_lsN_a1_q` / `xlat_tgt_tbi_lsN_a1` / `xlat_tgt_c_bit_lsN_a2` | 1 each | Attribute network | a1 / a1 / a2 | Translation-target M/TBI/C bits (TLB-F17). |
+| `ldtr_or_sttr_op_lsN_a1` | 1 | LS decode | a1 | LDTR/STTR op. |
+| `mmu_flt_lsN_a2_q` / `mmu_flt_replay_lsN_a2_q` | 1 each | LS abort | a2 | MMU fault / replay (post-walk). |
+| `tlb_sodev_mem_lsN_a2` / `tlb_nc_mem_lsN_a2` / `tlb_raw_nc_mem_lsN_a2` | 1 each | L2 / LS abort | a2 | SO-device / NC / raw-NC memory attribute. |
+| `priv_lsN_a2_q` | 1 | LS abort | a2 | Privileged attribute. |
+| `va_lsN_a2_q` | 64 | LRQ / SAB | a2 | Full VA carried to a2. |
+| `uid_lsN_a1_q` / `uid_lsN_a2_q` | `PERSEUS_UID` each | LRQ / SAB | a1 / a2 | uop-id carried per stage. |
+| `nested_virt_op_lsN_a1_q` / `_a2_q` | 1 each | LS abort | a1 / a2 | Nested-virt op class (TLB-F11). |
+| `rndr_op_lsN_a1_q` | 1 | LS decode | a1 | RNDR op class. |
+| `lsN_saved_at_op_hit_a2_q` | 1 | SAB (AT) | a2 | Saved AT-op hit on this pipe. |
+| `ns_lsN_a2` / `outer_alloc_lsN_a2` (repeated — already above) | — | — | — | (listed once). |
+| `tag_uncheck_lsN_a2_q` | 1 | MTE | a2 | Tag-uncheck at a2. |
+| `lsN_miss_req_to_mmu_a2` | 1 | `ls_mm` | a2 | Per-pipe miss-request indicator to MMU. |
+
+#### §5.2.3 Aggregate miss-to-MMU (L741–L757)
+
+| 信号 | 位宽 | 目的模块 | 活跃阶段 | 作用 |
+|------|------|----------|----------|------|
+| `ls_mm_tlb_miss_v_a2` | 1 | `ls_mm` | a2 | Aggregate miss valid (TLB-F02; driver `L11371`). |
+| `ls_mm_tlb_miss_va_a2` | `PERSEUS_LS_VA_MAX:12` | `ls_mm` | a2 | VA of the missing translation (TLB-F03). |
+| `ls_mm_tlb_miss_msid_a2` | 3 | `ls_mm` | a2 | MSID of miss. |
+| `ls_mm_tlb_miss_id_a2` | 2 | `ls_mm` | a2 | Outstanding-slot id (4 outstanding, TLB-F05). |
+| `ls_mm_tlb_miss_non_spec_a2` / `_wr_a2` / `_at_a2` / `_atomic_a2` / `_va2ipa_a2` / `_priv_a2` / `_pan_a2` / `_spe_a2` / `_sample_a2` / `_trbe_a2` / `_nfd_a2` / `_rndr_a2` | 1 each | `ls_mm` | a2 | Miss-classification flags (TLB-F03/F15/F27). |
+| `ls_mm_disable_coalescing` | 1 | `ls_mm` | static (held) | Disable MMU coalescing when current set-of-misses cannot be merged. |
+
+#### §5.2.4 Pipeline-summary (is_*/d2/d3/t4) (L777–L797, L892–L898)
+
+| 信号 | 位宽 | 目的模块 | 活跃阶段 | 作用 |
+|------|------|----------|----------|------|
+| `ls_is_uop_accept_lsN_d2` / `_d3` (N=0,1,2) | 1 each | Issue (scoreboard) | d2 / d3 | Downstream accept indicator per pipe. |
+| `ls_is_uop_reject_lsN_d2` / `_d3` (N=0,1,2) | 1 each | Issue | d2 / d3 | Reject indicator. |
+| `ls_is_tlb_miss_v_lsN_d2` / `_d3` (N=0,1,2) | 1 each | Issue | d2 / d3 | Miss-valid carried to Issue. |
+| `pmu_l1d_tlb_a1` / `_rd_a1` / `_wr_a1` | 3 each | PMU | a1 | PMU L1D-TLB access counters. |
+| `pmu_l1d_tlb_refill_t4` / `_rd_t4` / `_wr_t4` / `_pf_t4` | 1 each | PMU | t4 | PMU L1D-TLB refill counters. |
+
+#### §5.2.5 Snoop back-pressure + TBW (L143, L822, L836–L848)
+
+| 信号 | 位宽 | 目的模块 | 活跃阶段 | 作用 |
+|------|------|----------|----------|------|
+| `tlb_snp_tbw_busy` | 1 | Snoop | static (held) | TBW-busy back-pressure to snoop (TLB-F25). |
+| `tbw_busy` | 1 | Internal TBW | static (held) | Internal TBW-busy signal. |
+| `tlb_pf_lkup_outstanding` | 1 | Prefetcher | static (held) | Prefetch-lookup outstanding. |
+| `mmu_pf_lkup_resp_v` / `_flt` / `_wb` / `_id` / `_outer_alloc` / `_share_attr` / `_pa` / `_ns` / `_ctag` / `_pbha` | various (see ports) | Prefetcher | response cycle | MMU prefetch-lookup response bundle. |
+
+#### §5.2.6 SAB AT-saved snapshot (L851–L856)
+
+| 信号 | 位宽 | 目的模块 | 活跃阶段 | 作用 |
+|------|------|----------|----------|------|
+| `saved_info_valid_q` | 1 | SAB | static (held) | AT-saved info valid. |
+| `saved_pa_q` | `PERSEUS_SAVED_PA_RANGE` | SAB | static (held) | AT-saved PA. |
+| `mmu_saved_info_q` | `PERSEUS_SAVED_INFO_RANGE` | SAB | static (held) | AT-saved MMU info bundle. |
+| `tlb_replace_inv_any` | 1 | Replacement | static | Replacement-driver hook ("prefer invalid victim"; TLB-F42). |
+| `tlb_any_inv_or_wr` | 1 | Replacement | static | Any-entry-invalid-or-write indicator. |
+
+#### §5.2.7 Debug-RAM / Misc (L817–L818, L735, L1017–L1019, L1010–L1011)
+
+| 信号 | 位宽 | 目的模块 | 活跃阶段 | 作用 |
+|------|------|----------|----------|------|
+| `dbg_ram_rd_tlb_data_valid` / `dbg_ram_rd_tlb_data` | 1 / `PERSEUS_LS_L1_TLB_DBG_RD_INFO_SIZE` | Debug-RAM / SW | d2+ | Debug-RAM read port (TLB-F39). |
+| `precommitted_uop_flushed` | 1 | LS control | static (pulse) | Signals a precommit-uop was flushed (TLB-F33). |
+| `eff_hcr_e2h_tge` | 1 | LS fault encoder | static | Derived (e2h & tge). |
+| `ls_is_tlb_wakeup_iz` | 1 | Issue | iz | TLB-wakeup indicator to Issue at iz. |
+| `ls_l2_ctxt_change_v` / `ls_l2_ctxt_change_exec_state` | 1 / 3 | L2 | static (event) | L2-context change notification + exec-state. |
+
+#### §5.2.8 SPE-buffer path (L104, L951–L965)
+
+| 信号 | 位宽 | 目的模块 | 活跃阶段 | 作用 |
+|------|------|----------|----------|------|
+| `spe_sample_tlb_miss_a2` | 1 | SPE | a2 | SPE-sample TLB-miss (TLB-F27). |
+| `spe_va_to_pa_counter_q` | `PERSEUS_LS_SPE_VA_TO_PA_CNT_RANGE` | SPE | static | SPE VA→PA in-flight counter. |
+| `spe_inject_accept_a2` / `spe_buf_xlat_complete` / `spe_buf_pa` / `spe_buf_pbha` / `spe_buf_ns` / `spe_buf_cache_attr` / `spe_buf_share_attr` / `spe_buf_xlat_replay` / `spe_buf_discard_write` / `spe_buf_xlat_flt` / `spe_buf_xlat_flt_fsc` / `spe_buf_xlat_flt_ea` / `spe_buf_xlat_flt_ec` | various | SPE | a2 / response | SPE buffer handshake bundle. |
+
+#### §5.2.9 TRBE-buffer path (L992–L1005)
+
+| 信号 | 位宽 | 目的模块 | 活跃阶段 | 作用 |
+|------|------|----------|----------|------|
+| `tbe_inject_accept_a2` / `tbe_buf_xlat_complete` / `tbe_buf_xlat_replay` / `tbe_buf_xlat_unsucc` / `tbe_buf_pa` / `tbe_buf_pbha` / `tbe_buf_ns` / `tbe_buf_cache_attr` / `tbe_buf_share_attr` / `tbe_buf_xlat_flt` / `tbe_buf_xlat_flt_fsc` / `tbe_buf_xlat_flt_ea` / `tbe_buf_xlat_flt_ec` | various | TRBE | a2 / response | TRBE buffer handshake bundle. |
+
+**§5.2 summary: 9 output subgroups.**
+
+### §5.3 Grand totals
+
+- Total port declaration lines (from Task 7 step 3 grep): **757**.
+- Subtable groups used: **§5.1 × 13 input groups + §5.2 × 9 output groups = 22 functional-domain subtables**.
+- No port from the 757-line grep is omitted — all lines are accounted for in one of the subtables above (three-pipe signal rows are listed once with the `N∈{0,1,2}` convention to keep the tables readable per R1).
+
+---
+
+## §6 接口时序 (Important-Timing Waveforms)
+
+Framing rule for this section: per spec §7 R7, waveforms are authored **only for "important timings"** — cross-cycle handshakes, multi-state FSM transitions, multi-source concurrent events, and exception paths. Baseline trivial combinational hand-offs (e.g. a pure a1→a2 pipeline-register flop with no gating) are not shown here. Signal names in each waveform are identical to their §5 port-table entry. RTL line numbers are cited for each transition. Cycle counts that depend on environment (e.g. MMU walk latency, snoop-network delay) are labelled `(UNVERIFIED: ...)` per R5.
+
+Waveform legend: `_` = low, `‾` = high, `|` = edge, `X` = transition/don't-care, `=` = stable multi-bit value. Each cycle column is two characters wide to keep labels column-aligned.
+
+### §6.1 TLB Hit (baseline a1 → a2)
+
+**Scenario.** `ls0` issues a translated LD at a1, hits an existing TLB entry, produces PA + permission at a2. No miss, no fault. Shown as the baseline against which §6.2–§6.6 deviate.
+
+```
+Cycle:                                 T0  T1  T2  T3
+Stage:                                 a1  a2  a3
+clk                                    |‾|_|‾|_|‾|_|‾|_|
+valid_xlat_uop_ls0_a1                  __|‾‾‾|___________
+tlb_cam_v_ls0_a1                       __|‾‾‾|___________
+va_ls0_a1                              ==|=V==|===========   (V = lookup VA, L214)
+agu_addend_a/b_ls0_a1_q, carry_in…     ==|=V==|===========   (form V at a1, L209-L212)
+tlb_any_hit_ls0_a2                     ______|‾‾‾|_______   (L451)
+tlb_one_or_more_hits_ls0_a2            ______|‾‾‾|_______   (L452)
+ls0_pa_a2                              ======|=PA=|=======   (L456)
+permission_ls0_a2                      ======|=P=|========   (L478)
+ps_ls0_a2                              ======|=S=|========   (L484)
+tlbid_ls0_a2_q                         ______|=IDX|=======   (L481; flopped from a1 hit-select)
+ls_mm_tlb_miss_v_a2                    __________________   (L741; stays low)
+uid_ls0_a2_q                           ______|=UID|=======   (L689)
+```
+
+**Walkthrough.**
+- **T0 (a1).** Issue delivers the uop; `valid_xlat_uop_ls0_a1` (L273, driven inside the module) and `tlb_cam_v_ls0_a1` (L232, input) both rise. AGU presents `agu_addend_a_ls0_a1_q` / `_b` / `carry_in_ls0_a1_q` (L209–L212); the final adder inside `ls_tlb` forms `va_ls0_a1` (output, L214). The 44-entry CAM compares V against every entry in the same cycle; the page-size-grouped match cones drive `any_4k_hit_ls0_a1` / `any_coalesced_hit_16k_to_256k_ls0_a1` / `any_non_coalesced_hit_16k_to_256k_ls0_a1` (L5195–L5267) — *not on the port list*, so not plotted; they are summed into the a2 hit output via the hit-selector.
+- **T1 (a2).** Hit-selector flops hold: `tlb_any_hit_ls0_a2` (L451) and `tlb_one_or_more_hits_ls0_a2` (L452) go high; the 1-hot entry winner drives `ls0_pa_a2` (L456), `permission_ls0_a2` (L478), `ps_ls0_a2` (L484), `tlbid_ls0_a2_q` (L481). `ls_mm_tlb_miss_v_a2` (L741, driver L11371) stays low because `tlb_miss_ls0_a2` is deasserted (hit path).
+- **T2 (a3).** Outputs propagate to downstream consumers; no further TLB activity for this uop.
+
+**RTL references (transitions).**
+- `va_ls0_a1` formation and CAM-match span: `perseus_ls_tlb.sv:L5195-L5267`.
+- a2-side hit output fan: `L451-L488` (`tlb_any_hit_ls0_a2`, `ls0_pa_a2`, `permission_ls0_a2`, `ps_ls0_a2`, `tlbid_ls0_a2_q`).
+- Miss-valid driver (held low): `L11371`.
+
+### §6.2 TLB Miss → MMU walk → response (cross-module handshake, R7-1 + R7-4)
+
+**Scenario.** `ls0` LD misses in TLB at a2. Miss request is emitted to MMU; MMU performs a PTW of arbitrary length K cycles; MMU returns translation at T(2+K); slot freed; pipeline replays or consumes. The outstanding-miss slot is slot 0 (id=2'b00).
+
+```
+Cycle:                                 T0  T1  T2 …  T(2+K)  T(3+K)
+Stage:                                 a1  a2  a3
+valid_xlat_uop_ls0_a1                  __|‾‾|________________________
+va_ls0_a1                              ==|=V==|========================
+tlb_any_hit_ls0_a2                     ______|_|_______________________    (L451 — low = miss)
+tlb_miss_ls0_a2  (internal)            ______|‾‾|______________________    (feeds L11371)
+ls_mm_tlb_miss_v_a2                    ______|‾‾|______________________    (L741 / L11371)
+ls_mm_tlb_miss_va_a2                   ======|=V_hi=|==================    (L742)
+ls_mm_tlb_miss_id_a2                   ======|=00=|====================    (L744; 2-bit slot)
+ls0_miss_req_to_mmu_a2                 ______|‾‾|______________________    (L824)
+outstanding_miss_valid_q[0] (int)      ______|‾‾‾‾‾‾‾‾‾‾‾|____________    (L1754-L1760)
+                                              ◄── MMU PTW: K cycles ──►
+mm_ls_tlb_miss_resp_v                  __________________|‾‾|_________    (L804)
+mm_ls_tlb_miss_resp_id                 ==================|=00=|========    (L805)
+mm_ls_tlb_miss_resp_pa                 ==================|=PA=|========    (L807)
+mm_ls_tlb_miss_resp_attr               ==================|=AT=|========    (L808)
+mm_ls_tlb_miss_resp_flt                __________________|_|___________    (L806)
+mm_ls_tlb_miss_resp_replay             __________________|_|___________    (L810)
+outstanding_miss_valid_q[0] (int)      __________________________|_|__   (cleared)
+entry array fill (1 of 44)             _____________________|‾|________   (one-cycle write; RTL span TBD — Gate 9 §8)
+ls_is_tlb_wakeup_iz  (to Issue)        __________________|‾‾‾|_________    (L1019)
+```
+
+**Walkthrough.**
+- **T0 (a1).** Normal a1 lookup (same as §6.1).
+- **T1 (a2).** Hit-selector reports no entry matches → `tlb_any_hit_ls0_a2=0` (L451). The internal `tlb_miss_ls0_a2` goes high. Driver `L11371` gates the aggregate: `ls_mm_tlb_miss_v_a2 = (tlb_miss_ls0_a2 | tlb_miss_ls1_a2 | tlb_miss_ls2_a2) & ~ls_mm_idle_sys_req & (~miss_req_no_free_slots & …)`. Assuming slots available and not `ls_mm_idle_sys_req`, `ls_mm_tlb_miss_v_a2` rises (L741), together with the payload bundle `ls_mm_tlb_miss_va_a2` (L742), `_id_a2` (L744), `_msid_a2` (L743), and class bits (`_wr_a2`/`_at_a2`/`_atomic_a2`/`_priv_a2`/`_pan_a2` at L746–L751). `ls0_miss_req_to_mmu_a2` (L824) is the pipe-specific accompaniment. One outstanding slot is claimed: `outstanding_miss_valid_q[0]` (internal, L1754–L1760) rises.
+- **T2 … T(1+K).** MMU performs the page-table walk. `(UNVERIFIED: walk latency K is MMU implementation-dependent — anywhere from a few cycles for an L0-hit in the MMU-internal walk cache to tens of cycles for a full S1+S2 walk; the TLB side only sees `mm_ls_tlb_miss_resp_v` rise when the walker finishes.)` During this window `ls_is_tlb_wakeup_iz` (L1019) may assert once the walker signals "near done" via `early_mm_wakeup_m6_q` (input, L148) — this is the clock-enable for pending-miss bookkeeping flops (TLB-F37).
+- **T(2+K).** MMU drives `mm_ls_tlb_miss_resp_v=1` (L804) with matching `_id=2'b00` (L805), `_pa` (L807, 48:12), `_attr` (L808), `_va` (L809, VA_MAX:25), `_flt=0` (L806), `_replay=0` (L810). The response-capture logic (TLB-F04/F05) uses the 2-bit id to select the slot and writes one of the 44 entries (the chosen victim) with `{V=1, VA, PA, ASID, VMID, ps_code, attr...}`.
+- **T(3+K).** `outstanding_miss_valid_q[0]` clears; slot freed. The original uop is replayed from Issue (Issue sees `ls_is_tlb_wakeup_iz`, L1019) and on the next pass will hit per §6.1.
+
+**RTL references (transitions).**
+- Miss-valid driver: `perseus_ls_tlb.sv:L11371` (`ls_mm_tlb_miss_v_a2` assign).
+- Outstanding tracker flops: `L1754-L1760` (declaration region per §1.4/§3.2 witness).
+- Response ports: `L804-L810`.
+- `ls_is_tlb_wakeup_iz` output: `L1019`.
+- `early_mm_wakeup_m6_q` input: `L148`.
+- `(UNVERIFIED: walk latency K is MMU-implementation-dependent; exact resp-to-fill cycle count requires simulator run.)`
+
+### §6.3 Permission fault (abort path, R7-4)
+
+**Scenario.** `ls0` ST at a2 hits a TLB entry, but the entry's AP+PAN/UAO combination denies write access at the current EL. Translation succeeds (hit), but `permission_ls0_a2` encodes a fault; downstream abort path uses `mmu_flt_ls0_a2_q` / `prc_abort_hyp_ls0_a2` to raise a precise exception. No MMU interaction.
+
+```
+Cycle:                                 T0  T1  T2  T3
+Stage:                                 a1  a2  a3
+valid_xlat_uop_ls0_a1                  __|‾‾|_______________
+ls0_wr_a1                              __|‾‾|_______________   (L257 — ST class)
+va_ls0_a1                              ==|=V==|================
+tlb_any_hit_ls0_a2                     ______|‾‾|_____________   (L451 — hit)
+ls0_pa_a2                              ======|=PA=|============   (L456)
+permission_ls0_a2                      ======|=P_deny=|========   (L478 — encodes "write denied")
+eff_pstate_pan (static)                ‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾   (L67; PAN=1)
+prc_abort_hyp_ls0_a2                   ______|_|______________   (L909; EL1 case — not hyp-trap)
+mmu_flt_ls0_a2_q                       __________|‾‾|_________   (L679 — flopped flt)
+ls_mm_tlb_miss_v_a2                    ______________________   (L741 — stays low)
+ls_is_uop_reject_ls0_d2                __________|‾‾|_________   (L778)
+```
+
+**Walkthrough.**
+- **T0 (a1).** Issue presents a ST (`ls0_wr_a1=1`, L257). Stage-1 PAN/UAO derivation uses `eff_pstate_pan` (L67, static). The CAM lookup proceeds normally.
+- **T1 (a2).** `tlb_any_hit_ls0_a2=1` (L451) — the TLB *has* a translation. The hit-selector drives `ls0_pa_a2` (L456) and **`permission_ls0_a2` (L478) with a bundle that encodes "write denied at EL0/EL1 under PAN=1"**. The downstream permission-check combinational logic (outside ls_tlb proper, in the LS abort encoder) consumes this plus the ST-class bit to raise an abort. `ls_mm_tlb_miss_v_a2` stays low (this is a hit, not a miss).
+- **T2 (a3).** `mmu_flt_ls0_a2_q` (L679) is flopped high on the abort, and the pipeline summary output `ls_is_uop_reject_ls0_d2` (L778) rises; Issue treats the uop as rejected and will flush/replay per the normal abort path.
+
+**RTL references (transitions).**
+- Permission bundle: `perseus_ls_tlb.sv:L478` (`permission_ls0_a2`).
+- PAN input: `L67` (`eff_pstate_pan`).
+- `mmu_flt_ls0_a2_q` flop output: `L679`.
+- Hyp-abort input witness: `L909` (`prc_abort_hyp_ls0_a2`).
+- Pipeline-summary reject output: `L778` (`ls_is_uop_reject_ls0_d2`).
+- `(UNVERIFIED: the exact internal combinational AP/PAN/UAO resolver span inside ls_tlb is not resolved this gate; reference Gate 9 §8 for the permission-logic walkthrough.)`
+
+### §6.4 Multi-hit detect (aliasing fault, R7-4)
+
+**Scenario.** Two of the 44 entries match the same VA at a1 (e.g. a stale 4K entry coexists with a newly-filled 16K coalesced entry covering the same region). The 3× `perseus_ls_multi_hit_detect` instances (TLB-F22; `L10774 / L10786 / L10798`) raise `tlb_multi_hit_ls0_a2` and the coalesced path raises `tlb_hit_conflict_ls0_a2`. The uop is faulted (RAS-class).
+
+```
+Cycle:                                 T0  T1  T2  T3
+Stage:                                 a1  a2  a3
+valid_xlat_uop_ls0_a1                  __|‾‾|________________
+va_ls0_a1                              ==|=V==|================
+tlb_any_hit_ls0_a2                     ______|‾‾|_____________   (L451)
+tlb_one_or_more_hits_ls0_a2            ______|‾‾|_____________   (L452)
+tlb_hit_conflict_raw_ls0_a2            ______|‾‾|_____________   (L453)
+tlb_hit_conflict_ls0_a2                ______|‾‾|_____________   (L454 — coalesced-alias raw gated)
+ls0_pa_a2                              ======|=X=|=============   (L456 — indeterminate under multi-hit)
+permission_ls0_a2                      ======|=X=|=============   (L478 — indeterminate)
+mmu_flt_ls0_a2_q                       __________|‾‾|_________   (L679 — flt raised at a3)
+ls_mm_tlb_miss_v_a2                    ______________________   (L741 — stays low; not a miss)
+ls_is_uop_reject_ls0_d2                __________|‾‾|_________   (L778)
+```
+
+**Walkthrough.**
+- **T0 (a1).** Lookup presents V to CAM. Two entries' match cones (e.g. entry-9 flagged as 4K, entry-17 flagged as 16K) both fire for V. Each fires via its own page-size-group vector (`any_4k_hit_ls0_a1` vs `any_coalesced_hit_16k_to_256k_ls0_a1`, `L5195-L5222`).
+- **T1 (a2).** The 3× `perseus_ls_multi_hit_detect` instance for pipe-0 (L10774) XORs/one-hot-checks the aggregate hit vector and raises its multi-hit output, which combines with the coalesced-alias path (TLB-F23, `L1113-L1118`, `L5201-L5267`) into `tlb_hit_conflict_raw_ls0_a2` (L453) and the gated `tlb_hit_conflict_ls0_a2` (L454). `ls0_pa_a2` / `permission_ls0_a2` are held but are architecturally undefined (X on the waveform) because the 1-hot assumption is broken; downstream must not consume.
+- **T2 (a3).** `mmu_flt_ls0_a2_q` (L679) is raised for RAS bookkeeping; `ls_is_uop_reject_ls0_d2` (L778) asserts to Issue.
+
+**RTL references (transitions).**
+- Multi-hit detect instances: `perseus_ls_multi_hit_detect` at `L10774` / `L10786` / `L10798`.
+- Coalesced-alias path: `L1113-L1118`, `L5201-L5267`.
+- Outputs: `L453-L454` (raw / gated hit-conflict).
+- Fault flop: `L679`.
+- `(UNVERIFIED: the exact PA/permission behaviour under multi-hit — held-at-one-winner vs tri-state-X — depends on the hit-select MUX implementation; Gate 9 §8 resolves.)`
+
+### §6.5 TLBI snoop invalidation (cross-module + state change)
+
+**Scenario.** An external TLBI (from another core or from the local TLB-maintenance agent) arrives as a snoop-TMO at i2. The TLB qualifies the request against all 44 entries via ASID/VMID/sec/el/stage context-match, computes `snp_tmo_invalidate_vec_nxt` (L1935) over the entry array, and in one or more subsequent cycles clears matched entries. `tlb_snp_tbw_busy` (L143) is asserted to back-pressure more snoops during the window.
+
+```
+Cycle:                                 T-1 T0  T1  T2  T3  T4
+Stage:                                 -   i2  a1  a2
+snp_tmo_va_valid                       ___|‾‾|_________________   (L134)
+snp_tmo_vmid / _asid / _sec / _el / _stage
+                                       ===|=Q=|================    (L135-L141; held w/ request)
+snp_tmo_vmid_valid / _asid_valid       ___|‾‾|_________________    (L136, L138)
+tlb_snp_tbw_busy                       ___|‾‾‾‾‾‾‾‾‾|__________    (L143 — back-pressure window)
+snp_tmo_cr_{asid,vmid,msid}_match_i2   _______|‾‾|_____________    (internal, L11368 dbg, L1929-L1933 context)
+snp_tmo_invalidate_vec_nxt             _______|=VEC|============    (L1935; 44-wide; matched-entry bits =1)
+snp_tmo_invalidate_vec_q               _______________|=VEC|===    (internal flop, L11360 region)
+entry[k].V  (each k in VEC)            ‾‾‾‾‾‾‾‾‾‾‾‾‾‾|_|_______    (clears on clock-after-invalidate; RTL span — Gate 9)
+snoop_sync_inv_tlb_i2                  ___|‾‾|_________________    (L145 — sync-invalidate pulse)
+tbw_busy                               ___|‾‾‾‾‾‾‾‾‾‾‾|_______    (L822)
+```
+
+**Walkthrough.**
+- **T0 (i2).** Snoop agent drives `snp_tmo_va_valid=1` (L134) together with `snp_tmo_vmid` (L135), `snp_tmo_vmid_valid` (L136), `snp_tmo_asid` (L137), `snp_tmo_asid_valid` (L138), `snp_tmo_sec` (L139), `snp_tmo_el` (L140), `snp_tmo_stage` (L141), and `snoop_sync_inv_tlb_i2` (L145). `tlb_snp_tbw_busy` (L143) rises immediately; `tbw_busy` (L822) also rises.
+- **T1 (a1 relative to snoop).** Context-match pre-compute: `snp_tmo_cr_asid_match_i2` / `_vmid_match_i2` / `_msid_i2` (internal, referenced in `L11360`-region) are resolved. The per-entry `snp_tmo_context_match_a1` (internal 44-wide) is formed and `snp_tmo_invalidate_vec_nxt` (L1935) is computed over all 44 entries (TLB-F24).
+- **T2 (a2).** `snp_tmo_invalidate_vec_q` is flopped. The entry-array valid bits at each matched index are cleared on the following clock edge — exact span deferred to Gate 9 §8.
+- **T3 / T4.** `tlb_snp_tbw_busy` deasserts once the window closes; snoop-agent may issue the next maintenance op.
+
+**RTL references (transitions).**
+- Snoop-TMO inputs: `perseus_ls_tlb.sv:L134-L145`.
+- Back-pressure output: `L143` (`tlb_snp_tbw_busy`), `L822` (`tbw_busy`).
+- Invalidate-vector next: `L1935` (`snp_tmo_invalidate_vec_nxt`).
+- Context-match signal declarations referenced in region `L11360` per §6.2 neighborhood grep.
+- `(UNVERIFIED: exact entry-clear cycle count relative to snp_tmo_va_valid is environment-dependent — a single-cycle context-match-then-clear model is assumed; Gate 9 §8 walkthrough will pin down the precise flop span.)`
+
+### §6.6 Stage-2 nested translation (2 rounds of walks)
+
+**Scenario.** At EL1 with EL2 virtualisation active (`cur_vmon=1`, `cur_hyp=0`), a TLB miss on a guest-VA requires Stage-1 walk → gives an IPA → Stage-2 walk on that IPA → gives PA. The MMU itself sequences the two walks and the TLB side sees **two** rounds of `mm_ls_tlb_miss_resp_v` for cases where the S1 walk itself faults intermediate IPA translations, or **one** response at the end if the MMU pre-combines. This waveform covers the "two rounds visible at the ls_tlb / MMU boundary" case — the more pessimistic pattern — since it is what the TLB must be correctness-robust against.
+
+```
+Cycle:                               T0 T1 T2 …  T(2+K1)    …  T(2+K1+K2)   T(3+K1+K2)
+Stage:                               a1 a2 a3
+valid_xlat_uop_ls0_a1                __|‾‾|_________________________________________________
+va_ls0_a1                            ==|=V==|====================================================
+tlb_any_hit_ls0_a2                   ______|_|___________________________________________________   (L451)
+ls_mm_tlb_miss_v_a2                  ______|‾‾|__________________________________________________   (L741; round 1)
+ls_mm_tlb_miss_va_a2                 ======|=V_hi=|======================================================   (L742)
+ls_mm_tlb_miss_va2ipa_a2             ______|‾‾|__________________________________________________   (L749 — request is "walk S1 for guest-VA")
+outstanding_miss_valid_q[0]          ______|‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾|___________________________________     (L1754-L1760)
+                                           ◄── S1 walk: K1 cycles ──►
+mm_ls_tlb_miss_resp_v   (round 1)    __________________|‾‾|_____________________________________   (L804)
+mm_ls_tlb_miss_resp_id               ==================|=00=|===============================================   (L805)
+mm_ls_tlb_miss_resp_pa  (= IPA)      ==================|=IPA=|==============================================   (L807)
+mm_ls_tlb_miss_resp_replay           __________________|‾‾|_____________________________________   (L810 — "need S2 walk, replay")
+                                                           ◄── S2 walk: K2 cycles ──►
+(MMU internally issues S2 walk; no new ls_mm_tlb_miss_v_a2 emerges from TLB side — the
+ S2 walk is inside the MMU's walker. Once complete, the MMU returns a second response.)
+mm_ls_tlb_miss_resp_v   (round 2)    ____________________________________________|‾‾|___________   (L804)
+mm_ls_tlb_miss_resp_pa  (= final PA) ============================================|=PA=|==================   (L807)
+mm_ls_tlb_miss_resp_replay           ____________________________________________|_|____________   (L810 — "done")
+outstanding_miss_valid_q[0]          ________________________________________________|_|________      (slot freed)
+nested_virt_op_ls0_a2_q              ______|‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾|__________   (L869 — held through window)
+eff_hcr_e2h (static)                 ===========================================================   (L55)
+entry fill                           ___________________________________________________|‾|_____   (after final round; Gate 9 §8)
+ls_is_tlb_wakeup_iz                  ____________________________________________|‾‾‾|__________   (L1019)
+```
+
+**Walkthrough.**
+- **T0 (a1).** Guest-VA V presented with `nested_virt_op_ls0_a1_q=1` (L868, flopped to L869 at a2). `eff_hcr_e2h` (L55) and `cur_vmon` (L40) are static indicators. `stg2_hd` (L110) reflects Stage-2 HD-update policy for the bookkeeping.
+- **T1 (a2).** TLB miss: `ls_mm_tlb_miss_v_a2` rises (L741), payload includes `ls_mm_tlb_miss_va2ipa_a2=1` (L749) telling the MMU this is a guest-VA-needing-S1-walk. Slot 0 claimed.
+- **T2 … T(1+K1).** MMU performs Stage-1 walk. `(UNVERIFIED: K1 is MMU walker latency, workload- and walk-cache-dependent.)`
+- **T(2+K1).** MMU returns the intermediate result: `mm_ls_tlb_miss_resp_v=1` (L804) with `mm_ls_tlb_miss_resp_pa=IPA` (L807) and `mm_ls_tlb_miss_resp_replay=1` (L810) — this is the "keep slot busy, I still need to do S2" encoding. `(UNVERIFIED: whether this specific RTL snapshot uses `resp_replay` to signal "need S2 follow-up" or whether the MMU simply holds the TLB slot without emitting an intermediate `resp_v` rising edge — the spec-intent model is documented here; Gate 9 §8 can confirm by tracing the `outstanding_miss_*_q` clear predicate.)`
+- **T(3+K1) … T(1+K1+K2).** MMU performs Stage-2 walk on IPA. TLB slot remains busy.
+- **T(2+K1+K2).** MMU returns final result: `mm_ls_tlb_miss_resp_v=1` again (L804) with `mm_ls_tlb_miss_resp_pa = final PA` (L807), `mm_ls_tlb_miss_resp_replay=0` (L810). Entry is written with merged S1+S2 translation; `outstanding_miss_valid_q[0]` clears; `ls_is_tlb_wakeup_iz` (L1019) signals Issue to replay the uop.
+- **T(3+K1+K2).** Replay proceeds; uop now hits per §6.1.
+
+**RTL references (transitions).**
+- Nested-virt op flops: `perseus_ls_tlb.sv:L868-L869` (`nested_virt_op_ls0_a{1,2}_q`).
+- va2ipa request flag: `L749` (`ls_mm_tlb_miss_va2ipa_a2`).
+- Response ports: `L804-L810`.
+- Stage-2 HD input: `L110` (`stg2_hd`).
+- `eff_hcr_e2h`: `L55`.
+- `(UNVERIFIED: K1 and K2 walk latencies are MMU implementation-dependent; the two-rounds-of-resp_v encoding is the spec-intent model and is flagged for Gate 9 §8 confirmation against the MMU response protocol.)`
+
+### §6.7 R7 coverage summary
+
+| R7 criterion | Waveform(s) covering it |
+|--------------|-------------------------|
+| 1. Cross-cycle handshake | §6.2 (TLB↔MMU request/response), §6.6 (two-round nested request/response) |
+| 2. Multi-state FSM | §6.5 (TMO i2→a1→a2 invalidate state advance), §6.2 / §6.6 (outstanding-slot life cycle) |
+| 3. Multi-source concurrent | §6.2 / §6.6 (3 pipes contend for miss slots; aggregate miss-valid OR at L11371) |
+| 4. Exception path | §6.3 (permission fault), §6.4 (multi-hit alias fault), §6.5 (snoop-invalidate state change), §6.6 (nested-virt replay path) |
+
+**UNVERIFIED items introduced in §6 (R5 tally):**
+- §6.2 — MMU walk latency K is environment-dependent.
+- §6.3 — exact combinational AP/PAN/UAO span inside ls_tlb deferred to Gate 9 §8.
+- §6.4 — PA/permission behaviour under multi-hit (held-at-winner vs X) deferred to Gate 9 §8.
+- §6.5 — exact entry-clear cycle span relative to `snp_tmo_va_valid` rising edge deferred to Gate 9 §8.
+- §6.6 — K1/K2 walk latencies MMU-dependent; two-rounds-of-`resp_v` encoding flagged for Gate 9 §8 confirmation.
+
+**Waveform count: 6** (§6.1 baseline + §6.2–§6.6 important-timing).
+
+---
+
+*End of §5–§6. §7–§14 will be authored in Tasks 10–11 (Gates 9–10).*
 
