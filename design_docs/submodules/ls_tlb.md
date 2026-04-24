@@ -1783,5 +1783,258 @@ Also referenced — the `tbe_inject_reserve_slot_q` (L11493) and `crid_table_rep
 
 ---
 
-*End of §7–§9 (Gate 9). §10–§14 will be authored in Task 11 (Gate 10).*
+## §10 三级模块设计 (L3 Submodule Design)
+
+> Scope: L3 submodules instantiated inside `perseus_ls_tlb.sv`. Per spec §5.1 and R6, each L3 / shared primitive gets a *brief* description + port list + link; the full 14-section or 8-section doc belongs to the dedicated L3 / shared-primitive file. Where a dedicated file does not yet exist in the pilot scope, the entry is marked **deferred** (forward-ref).
+>
+> Spec-intent / RTL-snapshot framing (from §8.9) is preserved here: the plan template and spec §5.1 mentioned RRIP + age_matrix as candidate L3/primitives; the RTL snapshot resolves these differently (no RRIP; no age_matrix; inline second-chance/CLOCK + pairwise `age_compare` helpers instead).
+
+### §10.1 L3 inventory (RTL-observed)
+
+| # | Submodule (kind)                          | Instances in `ls_tlb` | RTL lines                          | Pilot status      | §                  |
+|---|-------------------------------------------|-----------------------|------------------------------------|-------------------|--------------------|
+| 1 | `perseus_ls_multi_hit_detect` (L3)        | 3 (`u_ls{0,1,2}_multi_hit_detect`) | `L10774` / `L10786` / `L10798`     | brief here; full doc **deferred** (future `design_docs/submodules/ls_multi_hit_detect.md`) | §10.2 |
+| 2 | `perseus_ls_age_compare` (helper, L3-lite)| 7 total               | `L11888`, `L11895`, `L11902` (a2 pairwise ×3); `L14695` (precommit uid); `L14750` / `L14756` / `L14762` / `L14768` (outstanding-entry flush ×4) | cross-ref to `../shared_primitives/ls_age_matrix.md §7.2` (same pairwise-ordering primitive family) | §10.3 |
+| 3 | `perseus_ls_rrip` (shared primitive)      | **0 (not instantiated)** — spec-intent only | — (grep `perseus_ls_rrip`/`u_rrip` = 0 hits; see §8.9) | spec-intent; **RTL resolves to inline second-chance/CLOCK in §8.9**. Forward-ref to future `shared_primitives/ls_rrip.md` (**deferred**) if/when that primitive is introduced in a later RTL revision. | §10.4 |
+| 4 | `perseus_ls_age_matrix` (shared primitive)| **0 (not instantiated)** | — (grep `perseus_ls_age_matrix` on `perseus_ls_tlb.sv` = 0 hits, confirmed Gate 10) | **Not used by ls_tlb.** Cross-ref `../shared_primitives/ls_age_matrix.md §7` only as an out-of-scope note. | §10.5 |
+| 5 | ECC wrappers (`perseus_ecc_*`)            | **0 (not instantiated)** — only the `PERSEUS_LS_ECC_POP_PARAM_DECL` header macro on the module declaration at `L28` | — (grep `perseus_ecc_` = 0 hits) | parameter hook only; actual ECC array inserted at integration via macro expansion. Forward-ref to future `shared_primitives/ls_ecc.md` (**deferred**). | §10.6 |
+
+**R6 compliance.** No shared-primitive internals are copied into this doc; each entry either stays a brief + port list (§10.2, §10.3) or is an explicit forward-ref (§10.4, §10.6) or an explicit "not instantiated" (§10.4, §10.5, §10.6).
+
+### §10.2 `perseus_ls_multi_hit_detect` — brief description
+
+**Role.** Parity-style one-hot/multi-hit detector over the 44-entry TLB `any_hit[43:0]` vector, producing a single-bit `multi_hit_nxt_cycle` that is flopped into a2 as `tlb_multi_hit_lsN_a2` (TLB-F22). One instance per pipeline (ls0/ls1/ls2).
+
+**Port list (from `perseus_ls_multi_hit_detect.sv:L30-L37`).**
+
+| Port                 | Width                         | Dir | Role                                                                                                                    |
+|----------------------|-------------------------------|-----|-------------------------------------------------------------------------------------------------------------------------|
+| `clk`                | 1                             | in  | functional clock                                                                                                        |
+| `reset_i`            | 1                             | in  | async reset (active-high)                                                                                               |
+| `vld_cam`            | 1                             | in  | CAM-compare valid qualifier for this cycle                                                                              |
+| `any_hit`            | `PERSEUS_LS_L1_TLB_SIZE` (44) | in  | per-entry hit vector at a1 (one bit per entry)                                                                          |
+| `stg_flop_hit`       | 1                             | in  | just-filled staging-flop also matches this VA (forms the 45th potential hit)                                            |
+| `multi_hit_nxt_cycle`| 1                             | out | ≥2 of `{any_hit[43:0], stg_flop_hit}` are 1 ⇒ multi-hit; flopped next-cycle into `tlb_multi_hit_lsN_a2` (RAS-class fault)|
+
+**Why a dedicated L3.** Centralises the ≥2-of-N reduction (a parity-like tree in RTL) so the three pipelines share one verified implementation, and gives a clean cycle boundary so the multi-hit signal is pre-computed at a1 and flopped into a2 to fit timing (`ls_tlb.sv:L1278–L1289`, see §8.5 narrative).
+
+**Pilot status.** Full L3 doc **deferred**; the module is small (one output, combinational tree + one-cycle flop) and its RTL is already fully quoted inside `ls_tlb.md §8.5`.
+
+### §10.3 `perseus_ls_age_compare` — helper primitive (pairwise ordering)
+
+**Role.** Pairwise age comparator between two one-hot-indexed participants; output is a single `older` bit. Used by `ls_tlb` in two clusters:
+
+- **a2 miss-arbitration** (TLB-F35) — three instances form the full pairwise order of `{ls0, ls1, ls2}`: `u_age_compare_ls1_vs_ls0_a2`, `u_age_compare_ls2_vs_ls0_a2`, `u_age_compare_ls2_vs_ls1_a2` (`L11888`, `L11895`, `L11902`).
+- **Precommit / outstanding flush** (TLB-F33, TLB-F36) — five instances: `u_uid_precommit_flush` (`L14695`) plus `u_uid_flush_flt_outsanding_entry_{0,1,2,3}` (`L14750`, `L14756`, `L14762`, `L14768`).
+
+**Relation to `perseus_ls_age_matrix`.** Both primitives implement the same mathematical relation (antisymmetric pairwise ordering) but for different fan-out: `age_matrix` handles N×N ordering over an N-entry queue (consumer internals), while `age_compare` handles a 2-operand compare per instance. See `../shared_primitives/ls_age_matrix.md §7.2` for the shared primitive's instantiation catalog and mathematical model (pairwise antisymmetry, upper-triangular encoding). This doc does not duplicate that material per R6.
+
+**Pilot status.** `age_compare` has no dedicated shared-primitive doc in the pilot; its usage in `ls_tlb` is documented here and within §8 narratives. If future scope adds an `ls_age_compare.md`, the link will be inserted here.
+
+### §10.4 `perseus_ls_rrip` — spec-intent, not instantiated
+
+| Spec-intent (plan §5.1 / spec §3)                                                                                  | RTL snapshot (PERSEUS-MP128-r0p3-00rel0, `ls_tlb.sv`)                                                                                                                                                                                                                      |
+|---------------------------------------------------------------------------------------------------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| Plan template and spec §5.1 listed `perseus_ls_rrip` as an expected L3 shared primitive (Jaleel et al. RRIP, ISCA 2010). | **Zero instances** of `perseus_ls_rrip` / `u_rrip` / any `rrip` identifier (grep at Gate 6 and re-confirmed at Gate 10). Replacement is implemented **inline** in `ls_tlb` as second-chance / CLOCK: 1-bit reference bit per entry (`tlb_sec_chance_bit_q[43:0]`) + two-level priority-encoded scan (high-table / low-table) + linear-scan fallback. See §8.9 for the full layer-by-layer walkthrough. |
+
+**Forward-ref.** A future `design_docs/shared_primitives/ls_rrip.md` is **deferred** to whatever RTL revision actually introduces the primitive (not present in the current snapshot).
+
+**Resolution.** The UNVERIFIED flag originally raised at §1 / TLB-F42 ("RRIP vs pseudo-LRU vs random") is **resolved** by §8.9 to second-chance/CLOCK. Propagated into the §13 UNVERIFIED summary.
+
+### §10.5 `perseus_ls_age_matrix` — explicit non-instantiation
+
+Per R6 and spec §5.1, age-matrix would be documented here if `ls_tlb` instantiated it. **It does not.** `grep perseus_ls_age_matrix perseus_ls_tlb.sv` at Gate 6 and re-confirmed at Gate 10 both return 0 hits. The shared-primitive doc at `../shared_primitives/ls_age_matrix.md §7.2` correctly excludes `ls_tlb` from its instantiation catalog.
+
+**Why age_matrix would be the wrong fit here.** TLB miss-arbitration is a 3-way ordering (ls0/ls1/ls2) at a2, not an N-entry queue; three `age_compare` helpers (§10.3) express the full ordering with O(3) flops instead of the 3×3 matrix (9 flops) plus mask logic an `age_matrix` would require.
+
+### §10.6 ECC wrappers — header-macro only
+
+RTL evidence of ECC in `ls_tlb`:
+- `L28` — module declaration decorated with `PERSEUS_LS_ECC_POP_PARAM_DECL` macro (TLB-F40). This is a parameter-hook allowing downstream ECC-array insertion at integration.
+- `grep 'perseus_ecc_' perseus_ls_tlb.sv` → **0 instances.** No ECC wrapper is instantiated inside `ls_tlb` at this RTL revision.
+
+**Pilot status.** Full ECC primitive doc **deferred** to a future `design_docs/shared_primitives/ls_ecc.md`. Testpoints TP-13 / TP-14 in §12 seed ECC behaviour under the assumption that the ECC wrapper is applied at integration via macro expansion; they are marked `(UNVERIFIED: ECC wrapper instance not visible inside ls_tlb.sv; stimulus assumes integration-time macro expansion realises the ECC array.)`.
+
+---
+
+## §11 调用者契约 (Caller Contract)
+
+> Contract obligations the caller (the rest of LSU — `ls_ctl`, `ls_agu`, `ls_ldpipe_ctl`, the MMU `ls_mm` interface, the snoop `snp_tmo_*` interface, the SPE/TRBE interfaces) must honour for `perseus_ls_tlb` to function correctly. Each assertion cites RTL evidence or is flagged `(UNVERIFIED)` per R5.
+
+### §11.1 Input stability (per-cycle invariants)
+
+| # | Assertion                                                                                                                                                                                                                        | RTL reference                                                      | Status                                                                                                                                           |
+|---|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|--------------------------------------------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------|
+| 1 | `cur_asid_el1` and `cur_asid_el2` must be stable across the a1→a2 window of any in-flight uop. A mid-translation ASID change is not specified and can cause the a2 CRID-compare (§8.3) to disagree with the CAM-hit vector decided at a1. | `L42–L44` (input ports); ASID consumption at `L1929` (`snp_tmo_cr_asid_match_i2`) and throughout the CRID-table path (§8.3). | **Architectural.** Upstream (`ls_ctl` + pipeline control) must freeze cur_asid_el* during a uop's a1→a2 span. (UNVERIFIED: no explicit assertion inside `ls_tlb.sv`; contract held by convention.) |
+| 2 | `cur_vmid` must be stable across a1→a2 of any in-flight uop. Same rationale as ASID.                                                                                                                                            | `L45` (input port); `L59` (`vmid_size_16bits`); `L1933` (snoop-TMO VMID match). | (UNVERIFIED: no explicit assertion; contract by convention.)                                                                                   |
+| 3 | `TCR_EL1` / `TCR_EL2` attribute inputs (TBI, TCMA, the nested-virt indicator driving CRID) must be coherent with the uop being translated. Changing TCR mid-pipe is architecturally a TLB-flush-requiring event.                  | TBI: `L92–L96`; TCMA: `L82–L86`; CRID nested-virt: `L12400`.        | (UNVERIFIED: contract by ARM-ARM convention; no intra-module assertion.)                                                                        |
+| 4 | `stg1_hd_el{1,2,3}` / `stg2_hd` (HW Access/Dirty update enables) must be stable across a1→a2 (they feed the attribute-select path inside the entry write-back).                                                                  | `L107–L110`.                                                        | (UNVERIFIED.)                                                                                                                                    |
+
+### §11.2 Outstanding-miss FSM contract (4 slots, 0..3)
+
+| # | Assertion                                                                                                                                                                                                                                                                           | RTL reference                                                              | Status                                                                                                            |
+|---|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|-----------------------------------------------------------------------------|-------------------------------------------------------------------------------------------------------------------|
+| 1 | `mm_ls_tlb_miss_resp_id[1:0]` (from MMU) must be the ID of a slot currently in BUSY (`outstanding_miss_valid_q[id] == 1`). A response to a FREE slot is not handled — the fill staging (§9.2 IDLE→STAGED) would mis-bind and the slot-clear at §9.1 BUSY→FREE would still fire for the named ID. | `L804–L810` (resp ports); §9.1 slot FSM; §9.2 staging FSM.                  | **Responsibility: MMU (`ls_mm`).** (UNVERIFIED: no `assert` inside `ls_tlb`; contract assumed by naming symmetry.) |
+| 2 | Outstanding-slot allocation (§9.1 FREE→BUSY): at most one new miss per cycle per pipeline; the allocator (`outstanding_miss_type_q` encode at `L2647–L2650`) uses priority encoding over 3 pipes × {LD / ST / PF / AT / …} types. Caller must not fire miss-request with two pipes selecting the same slot.       | `L2647–L2650`, `L1754–L1760`.                                               | Internal — single-allocator design; no external obligation. (UNVERIFIED: independence of per-pipe miss triggers.) |
+| 3 | `mm_ls_tlb_miss_resp_flt=1` must be paired with a valid slot ID. On fault, entry write is bypassed (no TLB entry created for a faulting translation), and the slot is cleared at §9.1 BUSY→FREE.                                                                                       | `L805` (flt port); §9.1 / §9.2.                                             | Internal handling verified §9.2 `resp_mark_invalid_final_t4` path.                                                 |
+| 4 | `mm_ls_tlb_miss_resp_replay=1` (TLB-F43) signals MMU-side retry; ls_tlb releases the slot but does not create an entry; caller (MMU) is responsible for the next attempt.                                                                                                            | `L810`.                                                                     | (UNVERIFIED: exact replay-re-issue handshake not traced in Gate 9.)                                               |
+
+### §11.3 Snoop-TMO / TLB-maintenance contract
+
+| # | Assertion                                                                                                                                                                                                                                | RTL reference                                   | Status                                                                                                                                 |
+|---|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|-------------------------------------------------|----------------------------------------------------------------------------------------------------------------------------------------|
+| 1 | `snp_tmo_va_valid` handshake (TLB-F24): caller (snoop) must hold `snp_tmo_va_valid` for the span required for `ls_tlb` to set `snp_tmo_invalidate_vec_q` and commit `tlb_val_q` clears (1–2 cycles — §8.10).                             | `L134–L141`, `L1927–L1935`, §8.10.              | Resolved at Gate 9 §8.10 (1–2 cycle span).                                                                                            |
+| 2 | `tlb_snp_tbw_busy` (TLB-F25) is an output; caller (snoop + TLBI issuer) must observe it and not issue an overlapping maintenance op while asserted.                                                                                      | `L822`.                                         | Internal output; caller obligation.                                                                                                    |
+| 3 | `snoop_sync_inv_tlb_i2` must align with the snoop FSM's i2 stage (caller-side); if misaligned, the `tbw_busy` / `snp_tmo_invalidate_vec_q` timing at §8.10 will desync.                                                                  | `L143–L145`, `L1927–L1935`.                     | (UNVERIFIED: exact i2-alignment contract not explicitly asserted in module.)                                                           |
+
+### §11.4 Boundary-condition guarantees (provided by `ls_tlb`)
+
+| # | Guarantee                                                                                                                                                                                                                                        | RTL reference                                |
+|---|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|-----------------------------------------------|
+| 1 | **Multi-hit always faults** — a coalesced or non-coalesced ≥2-of-N match never silently corrupts translation; `tlb_multi_hit_lsN_a2` is raised and fed as a RAS-class fault (TLB-F22, TLB-F23).                                                  | §8.5; `L10774 / L10786 / L10798`.             |
+| 2 | **Faulting MMU response does not create an entry** — `mm_ls_tlb_miss_resp_flt` bypasses the §9.2 STAGED→write-back transition; `wr_tlb_en_t4` remains 0 for a faulting response (§8.8 `resp_mark_invalid_final_t4` path).                       | §9.2; §8.8.                                   |
+| 3 | **Duplicate-miss suppression** — an in-flight miss for the same VA (matching against `miss_req_cam_va_lsN_a2_q[31:12]`) is not re-issued (TLB-F44).                                                                                             | `L1664–L1669`.                                |
+| 4 | **Invalidate → clear is atomic at cycle granularity** — a snoop-TMO invalidate clears the `tlb_val_q[tlb]` bit on the next clock edge (async-reset, see §7 / §8.1), so the invalidated entry cannot re-hit on the same or later a1.              | §8.1 (L13641, L2608); §8.10.                  |
+
+### §11.5 Undefined-behaviour cases (consult ARM ARM)
+
+- **ASID / VMID change mid-translation.** If the caller violates §11.1 items 1–2, the behaviour is architecturally UNPREDICTABLE per ARM ARM DDI0487L_b §D8 (TLB maintenance). `ls_tlb` does not detect or assert this condition; downstream effects range from a stale CRID match to a CAM-hit-without-CRID-match (entry stays live but reads as miss).
+- **TCR attribute change without preceding TLB-flush.** Per ARM ARM DDI0487L_b §D8.2 (Broadcast TLB maintenance), TCR_ELx changes affecting translation semantics require a TLB-invalidate sequence first; violating this is architecturally UNPREDICTABLE. `ls_tlb` does not enforce.
+- **Overlapping 4K and 16K/256K fills that alias to the same region.** Expected to be caught by the coalesced-multi-hit detector (TLB-F23) on subsequent lookups, but the faulting entry is not auto-evicted; software must follow up with a TLBI.
+
+---
+
+## §12 验证关注点 (Verification Focus Points)
+
+> Seed testpoints (not a full verification plan). Each row maps to one or more TLB-F<NN> features from §2 and names the RTL layer (§8 sub-section or §9 FSM) it exercises. A DV engineer expands each seed into concrete stimulus + checker code.
+
+| TP ID         | Scenario (stimulus)                                                                                                                                                 | Expected behaviour                                                                                                                                  | Feature(s) exercised                | RTL layer / §                              |
+|---------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------|-------------------------------------|--------------------------------------------|
+| `TLB-TP-01`   | Walk 6 page-size classes (4K / 16K coalesced / 16K non-coalesced / 64K / 2M / 512M or 1G — per `PERSEUS_LS_L1_TLB_PS_*` encodings) and hit each from each of 3 pipes | Per-size `any_<size>_hit_lsN_a1` rises on corresponding pipe; `ps_lsN_a2` carries decoded size; `tlbid_lsN_a2_q` is one-hot into the 44-entry vector | TLB-F01, F06, F07, F08              | §8.2 (address-match), §8.3 (CRID/size path)|
+| `TLB-TP-02`   | Cold TLB, single a1 VA → no hit; MMU returns with legal PA+attributes after K cycles                                                                                  | Slot 0..3 allocates FREE→BUSY (§9.1); staging flops IDLE→STAGED→write-back at t4 (§9.2); subsequent a1 hit returns PA                                | TLB-F02, F03, F04, F05              | §9.1, §9.2, §8.8                            |
+| `TLB-TP-03`   | Translate a region whose descriptor AP forbids the access class (e.g. RO page + store uop)                                                                            | `permission_lsN_a2_q` reports violating code; `ls_mm_tlb_miss_*` does **not** fire (hit, not miss); permission-fault propagates to `ls_ctl` at a2   | TLB-F13, F15 (PAN), F16 (UAO)       | §8.6 (permission block), §8.2               |
+| `TLB-TP-04`   | Inject two entries with identical VA/CRID (via deliberate fill ordering bypassing §11.4 item 3) and issue a1 VA matching both                                         | `tlb_multi_hit_lsN_a2=1`; fault raised; no silent translation                                                                                      | TLB-F22, F23                        | §8.5, L10774/86/98                          |
+| `TLB-TP-05`   | Issue TLBI ASIDe1 for ASID=X with multiple entries belonging to that ASID                                                                                            | `snp_tmo_invalidate_vec_q` covers all matching entries (via `snp_tmo_cr_asid_match_i2`, L1929); `tlb_val_q[tlb]` cleared next cycle for each        | TLB-F09, F24                        | §8.10, §6.5                                 |
+| `TLB-TP-06`   | Issue TLBI VAAE1 for a single VA present in the TLB                                                                                                                   | Only the matching entry's invalidate_vec bit is set; exactly one `tlb_val_q` cleared; others retained                                               | TLB-F24                             | §8.10                                       |
+| `TLB-TP-07`   | Stage-2 nested translation: stage1 IPA hits; stage2 walk then returns                                                                                                 | `stg1_hd_*` + `stg2_hd` drive the HD-update path; stage-bit on snoop interface propagates; nested-virt CRID (`PERSEUS_LS_CRID_NESTED_VIRT_VAL`) set | TLB-F11, F12, F10                   | §8.3, L12400                                 |
+| `TLB-TP-08`   | Warm TLB (45 entries LRU-aged), switch ASID (`cur_asid_el1`)                                                                                                          | Subsequent a1 on the previously-hit VAs now misses (CRID compare fails); replacement policy then ages out on fills; no spurious hit                 | TLB-F09, F30                        | §8.3 (CRID), §8.9                            |
+| `TLB-TP-09`   | Fill 45 entries into 44 slots (cause one eviction), check replacement = second-chance/CLOCK (not RRIP, not strict LRU)                                                | On the 45th fill, `victim_ptr_dec_q[tlb]` points to an entry whose `tlb_sec_chance_bit_q[tlb]=0`; if all are 1, reference bits clear (CLOCK sweep) then repeat; observed across 44 fills, sec-chance bits toggle per expected pattern. **Not** RRIP 2-bit RRPV | TLB-F42 (resolved), via §8.9         | §8.9                                        |
+| `TLB-TP-10`   | PAN=1 + kernel uop accessing user page; separately UAO=1 + unprivileged LDTR/STTR                                                                                      | PAN: `miss_req_pan_indicator_lsN_a1/a2` + fault flagged through `ls_mm_tlb_miss_pan_a2`; UAO: permission-block overrides unprivileged semantics      | TLB-F15, F16, F20                   | §8.6, L1671–L1676                            |
+| `TLB-TP-11`   | VA with top byte set to non-zero while TBI1_EL1 is enabled                                                                                                           | `eff_tbi_lsN_a1 = 1` ⇒ `xlat_tgt_tbi_lsN_a1` masks upper byte; CAM-match ignores bits [63:56]                                                        | TLB-F17                             | §8.2 (VA mask), L1265–L1267                  |
+| `TLB-TP-12`   | MTE-tagged load with TCMA=1 for this region                                                                                                                           | `eff_tcma_lsN_a1 = 1` ⇒ `mte_access_lsN_a2` gated low; no tag-check issued downstream                                                               | TLB-F18, F19                        | §8.3, L1268–L1270                            |
+| `TLB-TP-13`   | Inject single-bit error into an entry's stored field (stimulus assumes integration-time ECC wrapper per §10.6)                                                       | ECC SBE: downstream ECC array corrects on read; RAS log increments. (UNVERIFIED: ECC wrapper instance not visible inside `ls_tlb.sv`; stimulus assumes integration-time macro expansion.) | TLB-F40, (F22 for RAS class)       | §10.6 (forward-ref)                          |
+| `TLB-TP-14`   | Inject double-bit error (DBE) into an entry                                                                                                                          | ECC DBE: RAS fault class raised, uop aborts. (UNVERIFIED: same as TP-13.)                                                                         | TLB-F40                             | §10.6 (forward-ref)                          |
+| `TLB-TP-15`   | Assert `cb_dftramhold` / `cb_dftcgen` during MBIST sequence                                                                                                           | All fill/hit paths quiesce; entry-array clocks held; MBIST observer reads expected pattern. No collision with functional `clk_tlb_flops` gating (§7). | TLB-F38, F41                        | §7 (ICG), §8.1                                |
+| `TLB-TP-16`   | Fire 4 concurrent TLB misses (one per pipe + one from precommit retry) to fully populate 4 outstanding-miss slots                                                   | `outstanding_miss_valid_q[3:0]=4'b1111`; 5th miss blocked (back-pressure on miss-issue) until any slot drains; no slot double-allocation             | TLB-F05, F31, F32                    | §9.1 (4-slot FSM)                            |
+| `TLB-TP-17`   | Duplicate-miss test: two a1 VAs equal on consecutive cycles while first miss is outstanding                                                                           | 2nd miss is suppressed by `miss_req_cam_va_lsN_a2_q[31:12]` match; `ls_mm_tlb_miss_v_a2` does not re-fire for the duplicate                         | TLB-F44                             | §8.8, L1664–L1669                            |
+| `TLB-TP-18`   | VA-range pre-check: drive VA with upper-byte mix failing allones/allzeros check (and `ls_disable_va_frc_range_flt=0`)                                                | `ls{0,1,2}_va_frc_range_flt_a2_q=1` ⇒ VA-range fault; MMU miss not issued                                                                          | TLB-F21                             | §8.6, L9321/9937/10553                       |
+| `TLB-TP-19`   | Forced-miss / hit-post-force-miss path: assert an external force-miss during an a1 that would otherwise hit                                                          | `tlb_any_hit_no_force_miss_lsN_a{1,2}_q=0`, `tlb_any_hit_post_force_miss_lsN_a{1,2}_q=1`; downstream replay                                         | TLB-F30                             | §8.2, L2264–L2278                            |
+| `TLB-TP-20`   | SPE sampling: tag a uop as SPE-sample; cause it to miss the TLB                                                                                                      | `spe_sample_tlb_miss_a2` rises; `ls_mm_tlb_miss_spe_a2` carries the sample tag; SPE VA→PA FSM (§9.3) captures                                        | TLB-F27, F28                         | §9.3, L11435                                |
+| `TLB-TP-21`   | LOR-region translation: VA whose PA falls inside LOR descriptor table N (N∈{0..3})                                                                                    | Correct descriptor-set match signals propagate; ordering semantics observed downstream                                                             | TLB-F29                             | §8.3, L115–L130, L1344–L1351                 |
+| `TLB-TP-22`   | Back-to-back ASID/VMID switches across 3 pipes in the same cycle (adjacent a1)                                                                                       | With §11.1 items 1–2 contract held, each pipe gets the correct CRID; if violated, checker catches a CAM-hit-without-CRID-match (negative test)      | TLB-F09, F10                         | §8.3, §11.1                                   |
+
+**Total: 22 seeded testpoints** (plan floor = 15; all 6 page sizes, miss/walk, permission fault, multi-hit, TLBI ASID/VA, stage2 nested, ASID/VMID switch, replacement second-chance, PAN/UAO, TBI, TCMA, ECC SBE/DBE, MBIST, outstanding-slot saturation, duplicate-miss, VA-range, forced-miss, SPE, LOR all covered).
+
+---
+
+## §13 设计陷阱与注记 (Design Pitfalls & Notes)
+
+### §13.1 Area / power
+
+- **Entry array is flop-based, not SRAM.** 44 × (1 valid + 37 VA + 3 CRID + 3 PS + 1 smash + 1 global + 1 dev_htrap + 1 fwb_override) ≈ 48 bits × 44 ≈ 2112 flops for entry data, plus per-pipeline a2 capture (PA, permission, MTE, MSID) flops. Justified by the 1-cycle a1→a2 lookup budget (SRAM read would cost a full cycle) and by the fine-grain per-entry TLBI invalidate-vector path (§8.10). Chip-area consumers should expect this is a sizeable flop farm.
+- **44-entry clock-gated as one group** via `u_clk_tlb_flops_upd` ICG (§7; `L14041–L14049`). `clk_tlb_flops` only toggles on fill cycles (`tlb_stg_flops_val_q=1`) or when `chka_disable_ls_rcg` (DFT) forces it on — the common hit cycle is entirely quiescent.
+
+### §13.2 Correctness races
+
+- **Multi-hit detector on transient X during fill staging.** The `perseus_ls_multi_hit_detect` instances consume `any_hit[43:0]` + `stg_flop_hit`; during the staged-but-not-yet-committed window (§9.2 STAGED state), the staging flop and a to-be-evicted entry can both match the same VA. `vld_cam` and the coalesced-multi-hit gate (TLB-F23) are intended to mask this, but a naïve X-injection into the staging flop could produce a false-positive `tlb_multi_hit_lsN_a2`. (UNVERIFIED: exhaustive X-closure not performed in Gate 9.)
+- **Invalidate-vector vs fill race.** `snp_tmo_invalidate_vec_q` and `wr_tlb_en_t4[tlb]` can target the same slot in adjacent cycles; the next-state expression `tlb_valid_din[tlb] = tlb_val_q[tlb] & ~tlb_invalidate_vec[tlb] | wr_tlb_en_t4[tlb]` (L13641) resolves this in favour of the fill (write-OR takes precedence). **Pitfall:** if a TLBI for the same region arrives one cycle before the fill, the filled entry is valid post-fill — software expecting post-TLBI quiet must follow with a DSB sy (ARM ARM DDI0487L_b §D8.2).
+- **4-slot outstanding-miss deadlock / timeout.** All 4 slots BUSY with no MMU progress halts miss-issue (§9.1). The module has no built-in timeout; reliance is on MMU forward progress (`ls_mm` / walk engine) and upstream flush on long stall. (UNVERIFIED: no watchdog counter inside `ls_tlb`; LSU-level TMO path `ld_st_pf_tmo_inject_val_lsN_a1` exists at §7 but its timeout origin is outside `ls_tlb`.)
+
+### §13.3 Chicken bits observed in `ls_tlb.sv`
+
+| Chicken bit                     | RTL line | Purpose                                                                                                                 |
+|----------------------------------|----------|-------------------------------------------------------------------------------------------------------------------------|
+| `chka_disable_ls_rcg`           | `L36`    | Disable LS root clock gating (DFT / bring-up). Forces `clk_tlb_flops` and the three a2-per-pipe ICGs to always toggle.  |
+| `ls_disable_va_frc_range_flt`   | `L62`    | Disable VA-range fault forcing (bring-up path). When 1, the `va_frc_range_flt` AND-mask in §8.6 is bypassed.            |
+| `cb_dftramhold` / `cb_dftcgen`  | `L34–L35`| MBIST ram-hold + clock-gen-enable; see §7.                                                                              |
+| (no `ls_disable_tlb_asid_sz_force_zero` found in RTL — the plan-mentioned name is **not present**; the near-name `tlb_dbg_access_force_zero_d2` / `tlb_debug_access_force_zero_rndr_d2` at `L2297`, `L2312` are debug read-data force-zero predicates, not chicken bits.) | `L2297`, `L2312` | Informational only — not a functional chicken bit. |
+
+### §13.4 Spec-intent vs RTL-snapshot resolutions (framing summary)
+
+| Spec-intent (plan §5.1 / spec §3)       | RTL-snapshot resolution                                                                                 | Gate resolving |
+|------------------------------------------|---------------------------------------------------------------------------------------------------------|----------------|
+| RRIP L3 primitive expected               | **Inline second-chance / CLOCK**, 1-bit ref per entry, high/low priority-encoded tables + linear fallback | §8.9 / §10.4   |
+| age_matrix shared primitive expected     | **Not instantiated** in `ls_tlb`; pairwise `age_compare` used instead (7 instances)                     | §10.3 / §10.5  |
+| ECC wrapper inline instance expected     | **Header macro only** (`PERSEUS_LS_ECC_POP_PARAM_DECL`); wrapper instance added at integration           | §10.6          |
+| 44-entry bit layout expected (plan § —)  | Per-entry fields enumerated (§8.1 table): 48 visible bits across 8 fields                                | §8.1           |
+
+### §13.5 Consolidated UNVERIFIED summary (all 14 sections)
+
+| # | Source §                    | Claim                                                                                                                                         | Status                                                                                                 |
+|---|-----------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------|--------------------------------------------------------------------------------------------------------|
+| 1 | §1 / TLB-F42                | "RRIP vs pseudo-LRU vs random" replacement policy                                                                                             | **resolved** §8.9 / §10.4 (second-chance/CLOCK, 1-bit ref + priority-encoded tables + linear fallback) |
+| 2 | §1                          | Inline replacement logic scan deferred                                                                                                         | **resolved** §8.9                                                                                       |
+| 3 | §1                          | Possibility of non-`STATE`-named hand-coded state encodings                                                                                    | **resolved** §9 (4 FSMs inventoried; no further STATE-named encodings found)                            |
+| 4 | §1                          | FSM-absence claim based on negative grep only                                                                                                  | **resolved** §9 (exhaustive FSM scan: 4 FSMs)                                                           |
+| 5 | §2 / TLB-F01                | Numeric value 44 behind `PERSEUS_LS_L1_TLB_SIZE`                                                                                               | **resolved** §8.1 (44 confirmed by generate-for loop bound)                                             |
+| 6 | Gate 7/8 "44-entry layout"  | Exact bit layout                                                                                                                               | **partially resolved** §8.1 (48 visible bits across 8 fields; PA + permission are per-pipe a2 captures, not entry-array)     |
+| 7 | Gate 6 §6.3                 | Full AP/PAN/UAO permission span                                                                                                                | **partially resolved** §8.2 / §8.6 (address-match located; 24-way permission topology located, individual predicates not exhaustively quoted) |
+| 8 | Gate 6 §6.5                 | Exact entry-clear cycle span relative to `snp_tmo_va_valid`                                                                                   | **resolved** §8.10 (1–2 cycles)                                                                          |
+| 9 | §7.3                        | `cb_dftramhold` has no functional reference inside `ls_tlb.sv` body; consumed inside clock-gate cell DFT path only                            | **open** (Gate 10 integration walkthrough pending; functional correctness not affected)                  |
+| 10 | §8.1                        | Total per-entry bit count including sibling PA + permission + attribute captures not exhaustively tallied                                      | **open** — 48 visible bits subtotal documented; per-pipe a2 captures counted separately but not summed |
+| 11 | §8.6                        | Full 24-way permission combinational block (8 narrow predicates × 3 pipes) not individually quoted; topology located and cited                | **open** — lower-priority; topology sufficient for TP generation                                         |
+| 12 | §9.4                        | MTE-precommit FSM owning module not located; inputs land at `L89–L90` from upstream                                                           | **open** — out-of-scope for `ls_tlb` (upstream module)                                                   |
+| 13 | §11.1 items 1–4             | ASID/VMID/TCR stability contracts enforced by convention, no assertion inside module                                                          | **open — architectural** (ARM ARM §D8 mandate; caller responsibility)                                   |
+| 14 | §11.2 item 1                | MMU `mm_ls_tlb_miss_resp_id` well-formedness no intra-module assertion                                                                         | **open — architectural**                                                                                 |
+| 15 | §11.2 item 2                | Per-pipe miss-trigger independence                                                                                                             | **open**                                                                                                 |
+| 16 | §11.2 item 4                | Exact replay-re-issue handshake                                                                                                                | **open** (not traced in Gate 9; low-priority)                                                            |
+| 17 | §11.3 item 3                | i2-alignment contract on `snoop_sync_inv_tlb_i2`                                                                                              | **open**                                                                                                 |
+| 18 | §13.2                       | Multi-hit detector X-closure during staged-fill window                                                                                         | **open — low priority** (vld_cam + coalesced gate designed to mask)                                      |
+| 19 | §13.2                       | No intra-module watchdog for 4-slot saturation                                                                                                 | **open — architectural** (upstream TMO path exists at §7)                                                |
+| 20 | §10.6 / TP-13 / TP-14       | ECC wrapper not instantiated inside `ls_tlb.sv`; stimulus assumes integration-time macro expansion                                           | **open — forward-ref** (future `shared_primitives/ls_ecc.md`)                                            |
+
+Legend: **resolved** = addressed in a later gate of this doc; **partially resolved** = topology located, full detail deferred; **open** = carried forward for later gates or architecturally held by convention; **forward-ref** = depends on a future doc/primitive not in pilot scope.
+
+---
+
+## §14 参考资料 (References)
+
+### §14.1 RTL files
+
+| File                                                    | Role in this doc                                                                                                              |
+|---------------------------------------------------------|------------------------------------------------------------------------------------------------------------------------------|
+| `perseus_ls_tlb.sv` (16,709 lines)                      | Primary source — all §2 features, §5 ports, §6 timings, §7 clocks, §8 key circuits, §9 FSMs cite this file.                   |
+| `perseus_ls_multi_hit_detect.sv`                        | L3 submodule (3 instances in `ls_tlb` — §8.5, §10.2). 472 lines.                                                              |
+| `perseus_ls_age_compare.sv`                             | Pairwise-ordering helper (7 instances in `ls_tlb` — §10.3). Module file not walked in pilot; cross-ref only.                  |
+| `perseus_ls_defines.sv`                                 | `PERSEUS_LS_L1_TLB_SIZE`, `PERSEUS_LS_VA_MAX`, `PERSEUS_LS_CRID_EXT`, `PERSEUS_LS_L1_TLB_PS_*`, `PERSEUS_LS_CRID_NESTED_VIRT_VAL`, `PERSEUS_LS_CRID_RNDR_VAL`, `PERSEUS_LS_L1_TLB_DBG_RD_INFO_SIZE` macros. |
+| `perseus_ls_params.sv`                                  | Parameter bundle including `PERSEUS_LS_TLB_MULTI_HIT_INST` / `_DECL`, `PERSEUS_LS_ECC_POP_PARAM_DECL`.                         |
+| (integration-time) ECC wrappers `perseus_ecc_*.sv`     | Deferred — not instantiated inside `ls_tlb.sv`; see §10.6 and TP-13 / TP-14.                                                   |
+| (spec-intent, not present) `perseus_ls_rrip.sv`        | Not present in the current RTL snapshot — spec-intent only; see §10.4.                                                         |
+
+### §14.2 ARM architecture references
+
+- **ARM® Architecture Reference Manual for A-profile architecture, DDI0487L_b.**
+  - **Chapter D5 — The AArch64 Virtual Memory System Architecture (VMSA).** Governs ASID / VMID tagging, translation regimes, stage-1 + stage-2 nested translation, TCR_ELx attributes, PAN, UAO, TBI, page size support — maps to TLB-F09 / F10 / F11 / F12 / F15 / F16 / F17.
+  - **§D8.2 — TLB maintenance operations.** Governs TLBI instructions (ASID, VA, VAAE1, VALE1, IPAS2E1, …), broadcast semantics, DSB ordering — maps to TLB-F24 / F25, §11.3, §13.2.
+  - **§D7 — MTE (Memory Tagging Extension)** and **TCMA (Tag-Check-Memory-Access)** definitions — maps to TLB-F18 / F19.
+  - Section numbers cited at chapter / §D8.2 granularity only (per R5, no fabricated paragraph IDs).
+
+### §14.3 Academic
+
+- **Jaleel, Theobald, Steely Jr., Emer.** *High Performance Cache Replacement Using Re-Reference Interval Prediction (RRIP).* ISCA 2010. Cited here only because the **plan template and spec §5.1** referenced `perseus_ls_rrip` as an expected L3 primitive; the RTL snapshot resolves replacement as second-chance/CLOCK (see §8.9 / §10.4) so RRIP is **not** the actually-used policy — retained as an intellectual-ancestry reference and for any future RTL revision.
+- **(Second-chance / CLOCK algorithm.)** Classical reference: Corbató, *A Paging Experiment with the Multics System*, MIT MAC-TR-10 (1968); see also any modern OS textbook (Tanenbaum, Silberschatz) for the CLOCK / second-chance family. The 1-bit reference + priority-encoded scan implemented in §8.9 is a direct realisation.
+
+### §14.4 Internal cross-references (this pilot)
+
+- `../lsu_top_l1.md §2` — parent L1 feature list, source of `LSU-F<NN>` IDs used in §2's Linkage column.
+- `../lsu_top_l1.md §5` — L2 submodule catalog position of `ls_tlb`.
+- `../shared_primitives/ls_age_matrix.md §7` — shared-primitive instantiation catalog; `ls_tlb` is explicitly *not* in the catalog (see §10.5 of this doc).
+- `../shared_primitives/ls_age_matrix.md §7.2` — same pairwise-ordering mathematical family as the `age_compare` helper used here (§10.3); consult for the antisymmetric-pairwise invariant.
+- (Future) `shared_primitives/ls_ecc.md` — forward-ref from §10.6 / TP-13 / TP-14.
+- (Future) `shared_primitives/ls_rrip.md` — forward-ref from §10.4 (deferred; not present in current RTL).
+- (Future) `submodules/ls_multi_hit_detect.md` — forward-ref from §10.2 (deferred; RTL fully quoted inline in §8.5).
+
+---
+
+*End of §10–§14 (Gate 10). `ls_tlb.md` pilot module doc complete — 14 sections across Gates 6 through 10.*
 
