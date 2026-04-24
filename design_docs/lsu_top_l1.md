@@ -1,7 +1,7 @@
 # LSU L1 顶层框架 — `perseus_loadstore`
 
-> Top-level L1 scaffold for the ARM Perseus LSU (`perseus_loadstore`). Follows design-spec §5.3 (9 sections) and R1–R7 extraction rules. RTL citation base:
-> `/home/xy.mu/N2/MP128-r0p3-00rel0-2/MP128-BU-50000-r0p3-00rel0/perseus/logical/perseus_loadstore/verilog/`.
+> ARM Perseus LSU (`perseus_loadstore`) 的顶层 L1 框架文档。遵循设计规范 §5.3（9 节结构）及 R1–R7 提取规则。RTL 引用根目录：
+> `/home/xy.mu/N2/MP128-r0p3-00rel0-2/MP128-BU-50000-r0p3-00rel0/perseus/logical/perseus_loadstore/verilog/`。
 
 ---
 
@@ -66,11 +66,11 @@ LSU 在 **ARMv9** 架构下承担（所有声明均有 RTL 证据）：
 | LSU-F22 | **Load Forwarding (SB/L2-bypass)** | `perseus_loadstore.sv:L16575-L16699`（`u_ld_fwd_ls0/1/2`） | 从 store buffer 与 L2-bypass 路径前递数据，ls2 使用 `no_l2` 变体（只允许 SB 前递）。 |
 | LSU-F23 | **LPT — Load Physical Trace** | `perseus_loadstore.sv:L18073`（`u_lpt`） | 跟踪 load 物理地址历史，供监控/SPE 采样使用。 |
 | LSU-F24 | **SPE — Statistical Profiling Extension** | `perseus_loadstore.sv:L18881`（`u_spe`）+ 端口分组 `spe_*` | 采样 load/store 延迟、PA、属性，外送 Trace 子系统。 |
-| LSU-F25 | **RAS (error reporting)** | 端口 `ras_*`（4 个 output） + ECC 模块 `perseus_ls_ecc*` (deferred) | 校验错上报至 RAS 节点；ECC 检查侧存在但细节见共享原语。 |
+| LSU-F25 | **RAS (错误上报)** | 端口 `ras_*`（4 个 output） + ECC 模块 `perseus_ls_ecc*` (deferred) | 校验错上报至 RAS 节点；ECC 检查侧存在但细节见共享原语。 |
 | LSU-F26 | **MPMM 功耗管理 / 活动度控制** | `perseus_loadstore.sv:L19128`（`u_mpmm_ctl`）；端口 `dt_ls_mpmm_*` + `is_ls_max_pwr` | 根据 gear/阈值节流三路 pipe 的发射，输出 `ls_am_max_pwr_throttle_active`。 |
 | LSU-F27 | **MBIST 控制** | `perseus_loadstore.sv:L13171`（`u_mbist`） | 对 tag/data RAM 执行内建自测。 |
 | LSU-F28 | **Monitor / 性能计数** | `perseus_loadstore.sv:L17808`（`u_monitor`） | 聚合 load/store 事件供 PMU。 |
-| LSU-F29 | **Reset 同步** | `perseus_loadstore.sv:L9512`（`u_rst`） | 生成内部同步复位，处理 `poreset` / `reset_i` 复合。 |
+| LSU-F29 | **复位同步** | `perseus_loadstore.sv:L9512`（`u_rst`） | 生成内部同步复位，处理 `poreset` / `reset_i` 复合。 |
 | LSU-F30 | **LSU 全局控制 (LSCTL)** | `perseus_loadstore.sv:L7480`（`u_ctl`） | 全局 enable、flush 广播、多路仲裁控制中枢。 |
 | LSU-F31 | **MPAM / Trace 外送属性** | 端口 `mx_ls_mpam_*`（`perseus_loadstore.sv:L42-L1173` 中 18 input）+ `tbe_*` | 将 MPAM partid/pmg 随访存请求送到 L2；接收 TRBE 同步/halt 握手。 |
 
@@ -163,202 +163,202 @@ LSU 在 **ARMv9** 架构下承担（所有声明均有 RTL 证据）：
 ### ls_agu — AGU 地址生成单元
 在 a1 阶段为 ls0/ls1/ls2 三路生成 48 位 VA，将 `is_ls_srca_data_*_i2` 作基址，`is_ls_srcb_data_*_i2` 经 shift/extend 后做加法；同时把 SPE/TBE/PF/Snoop/Late-resolve 等 6 种非 issue 源通过仲裁器注入到 a1 阶段（bubble-on-inject）。其输出 `va_ls*_a1` 被 TLB、AGU、WPT、VA region 同时消费。
 **RTL:** `perseus_ls_agu.sv`（顶层实例 `perseus_loadstore.sv:L6065`）
-**Pilot status:** deferred
+**Pilot 状态:** deferred
 
-### ls_tlb — L1 uTLB + MMU handshake
+### ls_tlb — L1 uTLB + MMU 握手
 44 项全关联 L1 uTLB（`perseus_ls_defines.sv:L448-L450`），在 a2 阶段完成 VA→PA 翻译及 AP/MemAttr 检查；miss 时通过 `ls_mm_tlb_miss_*` 发往 MMU 并等待 `mm_ls_tlb_fill_*` 回填。维护 VMID/ASID 标签和 stage-flop，支持 invalidate（TLBI）与 debug read (`dt_ls_dbg_addr`)。
 **RTL:** `perseus_ls_tlb.sv`（顶层实例 `perseus_loadstore.sv:L6709`）
-**Pilot status:** documented in `design_docs/submodules/ls_tlb.md`
+**Pilot 状态:** 已文档化于 `design_docs/submodules/ls_tlb.md`
 
 ### ls_ctl — LSU 全局控制 (LSCTL)
 LSU 中枢控制器，汇总 flush（`ct_flush_uid`/`bx_flush_uid`）广播至所有队列、做全局 `block_ls_1/2`/`direct_blk_en` 节流、处理 reseed/stid 生成。决定本周期哪些 pipe 被允许发射 (`is_ls_max_pwr` / MPMM 结果集成)。
 **RTL:** `perseus_ls_ctl.sv`（顶层实例 `perseus_loadstore.sv:L7480`）
-**Pilot status:** deferred
+**Pilot 状态:** deferred
 
 ### ls_lrq — Load Retire Queue
 16 项按 UID 索引的 load 跟踪队列（`PERSEUS_LS_LRQ_SIZE=5'd16`，`perseus_ls_defines.sv:L721`）。记录每条 in-flight load 的 state/地址/属性/forward 来源，驱动 FSM 决定 replay、snoop-hit、retire；与 `ls_age_matrix` 合作做 ordering 校验。通过 `ls_ct_rslv_uid_ld_ls*` 向 commit 端报告 resolve 顺序。
 **RTL:** `perseus_ls_lrq.sv`（顶层实例 `perseus_loadstore.sv:L12433`）
-**Pilot status:** documented in `design_docs/submodules/ls_lrq.md`
+**Pilot 状态:** 已文档化于 `design_docs/submodules/ls_lrq.md`
 
 ### ls_lrq_entry — LRQ 单表项 (L3)
 LRQ 每一项的状态 flop + next-state 组合逻辑，封装成独立模块以便 16 份实例化。包含 state 机核心、forward-hit 计算、retry counter。
 **RTL:** `perseus_ls_lrq_entry.sv`（由 `ls_lrq` 内部例化）
-**Pilot status:** deferred（由 ls_lrq 文档 §10 作为 L3 递归覆盖）
+**Pilot 状态:** deferred（由 ls_lrq 文档 §10 作为 L3 递归覆盖）
 
 ### ls_sab — Store Address Buffer
 缓存在途 store 的地址、控制、类型、属性，直到 commit 才释放。参与三类检查：RAW 前递（与 `u_raw`）、snoop 命中、store-to-load forwarding。使用 `ls_age_matrix` 维护年龄顺序。
 **RTL:** `perseus_ls_sab.sv`（顶层实例 `perseus_loadstore.sv:L8449`）
-**Pilot status:** deferred
+**Pilot 状态:** deferred
 
 ### ls_sdb — Store Data Buffer
 保存与 SAB 配对的 store 数据；commit 时把数据写入 L1 或交给 L2IF 外送。支持向量 store 数据来自 VX 通道 (`vx_ls_store_data_p*_v1`)。
 **RTL:** `perseus_ls_sdb.sv`（顶层实例 `perseus_loadstore.sv:L9331`）
-**Pilot status:** deferred
+**Pilot 状态:** deferred
 
 ### ls_fb — Fill Buffer
 16 项 miss-fill 缓冲 (`PERSEUS_LS_FB_SIZE=16`，`perseus_ls_defines.sv:L913`)。miss 时分配 entry，向 `u_l2if` 发起 line request，fill 返回后把 data 写 data_arr + 唤醒等待该行的 LRQ 项。支持 evict 并与 `u_snoop` 合作响应 intervening snoop。
 **RTL:** `perseus_ls_fb.sv`（顶层实例 `perseus_loadstore.sv:L10578`）
-**Pilot status:** deferred
+**Pilot 状态:** deferred
 
 ### ls_fb_entry — FB 单表项 (L3)
 Fill buffer 的单项 FSM 与 tag/state/data hold 寄存器。
 **RTL:** `perseus_ls_fb_entry.sv`
-**Pilot status:** deferred
+**Pilot 状态:** deferred
 
 ### ls_rar — Read-After-Read Queue
 40 项按 UID 记录已发射 load，用于 snoop 侵入时判定是否违背 ordering（`PERSEUS_LS_RAR_SIZE=40`，`perseus_ls_defines.sv:L898`）。若 snoop 命中比某 retire 过的 older-load 更老的地址，则触发 replay/flush。
 **RTL:** `perseus_ls_rar.sv`（顶层实例 `perseus_loadstore.sv:L10223`）
-**Pilot status:** deferred
+**Pilot 状态:** deferred
 
 ### ls_rar_entry — RAR 单表项 (L3)
 RAR 每项的 state + 地址 tag + age-link，便于 40 份实例化。
 **RTL:** `perseus_ls_rar_entry.sv`
-**Pilot status:** deferred
+**Pilot 状态:** deferred
 
-### ls_raw — Read-After-Write Forwarding
-28 项 (`PERSEUS_LS_RAW_NUM=28`，`perseus_ls_defines.sv:L706`) 跟踪"load 等待前方 store 数据可用"的情形。命中时由 SDB 把 store 数据旁路给 load；miss/部分命中则由 LRQ 安排 replay。
+### ls_raw — Read-After-Write 前递
+28 项 (`PERSEUS_LS_RAW_NUM=28`，`perseus_ls_defines.sv:L706`) 跟踪“load 等待前方 store 数据可用”的情形。命中时由 SDB 把 store 数据旁路给 load；miss/部分命中则由 LRQ 安排 replay。
 **RTL:** `perseus_ls_raw.sv`（顶层实例 `perseus_loadstore.sv:L17894`）
-**Pilot status:** deferred
+**Pilot 状态:** deferred
 
 ### ls_raw_entry — RAW 单表项 (L3)
 每项保存 load UID、waiting store STID、部分命中掩码。
 **RTL:** `perseus_ls_raw_entry.sv`
-**Pilot status:** deferred
+**Pilot 状态:** deferred
 
-### ls_mb — Memory Barrier Unit
+### ls_mb — Memory Barrier 单元
 处理 DMB/DSB/ISB 系列屏障：等待 SAB/SDB 清空、锁定发射、广播完成给 commit。与 `dsb_block`（端口 `ic_ls_dsb_block`）协同。
 **RTL:** `perseus_ls_mb.sv`（顶层实例 `perseus_loadstore.sv:L10465`）
-**Pilot status:** deferred
+**Pilot 状态:** deferred
 
 ### ls_l2if — L2 接口桥
 把 LSU 内部 fill/evict/snoop-resp/store 请求转成 L2 bank 协议（`l2b0_*`/`l2b1_*` 双 bank，端口统计分别 17 out/1 in）；接收 L2 返回的 snoop 请求/fill 数据。L2 侧静态配置由 `axisc_static_config_ack`/`axisc_scu_present` 决定。
 **RTL:** `perseus_ls_l2if.sv`（顶层实例 `perseus_loadstore.sv:L11064`）
-**Pilot status:** deferred
+**Pilot 状态:** deferred
 
 ### ls_data_arr — L1 D-Cache 数据阵列
 参数化 data RAM（容量由 `L1_DCACHE_SIZE_LOG` + `L1_DCACHE_VA_BITS` 决定，`perseus_ls_defines.sv:L607-L614`；4 way, `PERSEUS_LS_DCACHE_WAYS=4`）。支持 ECC/保护（依 `CORE_CACHE_PROTECTION` 参数）。
 **RTL:** `perseus_ls_data_arr.sv`（顶层实例 `perseus_loadstore.sv:L11965`）
-**Pilot status:** deferred
+**Pilot 状态:** deferred
 
 ### ls_tag_arr — L1 D-Cache 标签阵列
 与 data_arr 成对的 tag RAM；与 `ls_tag_arr_plru`、`ls_way_track` 共同决定命中/替换。`PERSEUS_LS_TAG_RAM_IDX_RANGE` 表达与 L1_DCACHE_SIZE_LOG 联动的 index 范围。
 **RTL:** `perseus_ls_tag_arr.sv`（顶层实例 `perseus_loadstore.sv:L14065`）
-**Pilot status:** deferred
+**Pilot 状态:** deferred
 
 ### ls_tag_arr_plru — D-Cache PLRU 状态
 维护 tag RAM 的 PLRU 位图（`PERSEUS_LS_DCACHE_PLRU_SETS` 随 cache 大小而变，`perseus_ls_defines.sv:L702`），为替换决策提供伪-LRU 位。
 **RTL:** `perseus_ls_tag_arr_plru.sv`（顶层实例 `perseus_loadstore.sv:L14263`）
-**Pilot status:** deferred
+**Pilot 状态:** deferred
 
-### ls_ldpipe_ctl — Load Pipeline 控制
+### ls_ldpipe_ctl — Load 流水线控制
 三路 LD pipe 的 per-stage 握手、stall、bubble 控制中心；裁决哪条 pipe 在 d0 进入 tag/data 读。
 **RTL:** `perseus_ls_ldpipe_ctl.sv`（顶层实例 `perseus_loadstore.sv:L14365`）
-**Pilot status:** deferred
+**Pilot 状态:** deferred
 
 ### ls_tag_data_arb — Tag/Data 端口仲裁
 在 d0 阶段对 tag RAM 与 data RAM 的多来源访问（3 条 load pipe + FB fill + snoop + MBIST）做 round-robin/priority 仲裁。
 **RTL:** `perseus_ls_tag_data_arb.sv`（顶层实例 `perseus_loadstore.sv:L13212`）
-**Pilot status:** deferred
+**Pilot 状态:** deferred
 
 ### ls_snoop — Snoop 接收与处理
 接收来自 `u_l2if` 的 snoop 请求，查询 tag/LRQ/SAB/RAR，生成 snoop data/ack；管理 snoop entry + self-entry 两种变体。
 **RTL:** `perseus_ls_snoop.sv`（顶层实例 `perseus_loadstore.sv:L12154`）
-**Pilot status:** deferred
+**Pilot 状态:** deferred
 
 ### ls_snoop_entry / ls_snoop_self_entry — Snoop 表项 (L3)
 Snoop/self-snoop 单项状态机。
 **RTL:** `perseus_ls_snoop_entry.sv`, `perseus_ls_snoop_self_entry.sv`
-**Pilot status:** deferred
+**Pilot 状态:** deferred
 
 ### ls_wpt — Watchpoint 匹配单元
 每条 LS pipe 一个实例 (`u_wpt_ls0/1/2`, `perseus_loadstore.sv:L17580/L17656/L17732`)。在 a2 拿 VA 与 watchpoint 寄存器做范围比较，输出 `watchpoint_ls*_a2`。
 **RTL:** `perseus_ls_wpt.sv`, `perseus_ls_wpt_cmp.sv`
-**Pilot status:** deferred
+**Pilot 状态:** deferred
 
 ### ls_flt_ctl — Fault 控制
 每条 LS pipe 一个实例 (`u_flt_ctl_ls0/1/2`, `perseus_loadstore.sv:L17121/L17274/L17427`)，综合 TLB fault、alignment fault、watchpoint 到 pipe-level abort 决策。
 **RTL:** `perseus_ls_flt_ctl.sv`
-**Pilot status:** deferred
+**Pilot 状态:** deferred
 
 ### ls_ld_forward / ls_ld_forward_no_l2 / ls_ld_l2_byp_forward — Load 前递
 `u_ld_fwd_ls0/ls1` 走完整前递 (SB + L2 bypass)；`u_ld_fwd_ls2` 用 `no_l2` 变体（只 SB 前递）以节省面积；`ld_l2_byp_forward` 为 L2 fill 直通路径。
 **RTL:** `perseus_ls_ld_forward.sv`, `perseus_ls_ld_forward_no_l2.sv`, `perseus_ls_ld_l2_byp_forward.sv`（顶层 `perseus_loadstore.sv:L16575-L16699`）
-**Pilot status:** deferred
+**Pilot 状态:** deferred
 
 ### ls_ld_align / ls_ld_align_swirl_ctl — 标量 Load 对齐
 把 128b 数据阵列输出按 `align_to/size` 旋转到目标寄存器位置；swirl_ctl 处理 cross-lane 位移控制信号。
 **RTL:** `perseus_ls_ld_align.sv`, `perseus_ls_ld_align_swirl_ctl.sv`
-**Pilot status:** deferred
+**Pilot 状态:** deferred
 
 ### ls_ld_vec_align / ls_ld_vec_align_swirl_ctl — 向量 Load 对齐
 SVE/Neon 向量 load 的元素级对齐与跨 lane swirl。三路实例 `u_ld_vec_align_ls0/1/2`（`perseus_loadstore.sv:L17013-L17085`）。
 **RTL:** `perseus_ls_ld_vec_align.sv`, `perseus_ls_ld_vec_align_swirl_ctl.sv`
-**Pilot status:** deferred
+**Pilot 状态:** deferred
 
 ### ls_ld_unalign_buf — 非对齐 Load 合并缓冲
 跨 cacheline 的 load 被拆成两次访问，该缓冲把两次数据拼回。
 **RTL:** `perseus_ls_ld_unalign_buf.sv`（顶层实例 `perseus_loadstore.sv:L16756`）
-**Pilot status:** deferred
+**Pilot 状态:** deferred
 
 ### ls_atomic_alu / ls_atomic_alu_byte — 原子 ALU
 在 LSU 侧执行 LD/ST exclusive、ARMv8.1 atomic (LDADD/LDSET/LDCLR/LDEOR/LDSMAX 等) 的 RMW 操作。byte 变体处理字节粒度 op。
 **RTL:** `perseus_ls_atomic_alu.sv`, `perseus_ls_atomic_alu_byte.sv`
-**Pilot status:** deferred
+**Pilot 状态:** deferred
 
 ### ls_monitor — 事件监测
 聚合 cache hit/miss、forward、replay、snoop 等事件作为 PMU 计数器输入。
 **RTL:** `perseus_ls_monitor.sv`（顶层实例 `perseus_loadstore.sv:L17808`）
-**Pilot status:** deferred
+**Pilot 状态:** deferred
 
 ### ls_lpt — Load Physical Trace
 跟踪最近 N 条 load 的 PA 与属性，供 SPE/TRBE 采样。
 **RTL:** `perseus_ls_lpt.sv`, `perseus_ls_lpt_entry.sv`（顶层实例 `perseus_loadstore.sv:L18073`）
-**Pilot status:** deferred
+**Pilot 状态:** deferred
 
 ### ls_way_track / ls_vic_way_track / ls_way_track_entry — Way 追踪
 `u_way_track` (`L18155`) 跟踪 in-flight load 对应 way，避免 fill 冲突；`u_vic_way_track` (`L18329`) 跟踪 victim way 防止被并发 fill 破坏。L3 `ls_way_track_entry` 为单项。
 **RTL:** `perseus_ls_way_track.sv`, `perseus_ls_vic_way_track.sv`, `perseus_ls_way_track_entry.sv`
-**Pilot status:** deferred
+**Pilot 状态:** deferred
 
 ### ls_pf / ls_pf_* — 硬件预取
 `u_pf` (`L18375`) 作为 PF 顶层；其下包含 stride/pattern 检测（`ls_pf_stride*`, `ls_pf_pht_ctl`）、训练表（`ls_pf_train_table`, `ls_pf_train_entry`, `ls_pf_train_buffer_entry`）、生成表（`ls_pf_gen_table`, `ls_pf_gen_req_entry`, `ls_pf_gen_tlb_entry`）、配置更新 (`ls_pf_conf_upd`) 与 page buffer、VA hash、store stride、stride 距离/抗冲突（`ls_pf_stride_cm`, `ls_pf_stride_distance`, `ls_pf_stride_thrash_repl`）、store 专用 stride (`ls_pf_st_stride`)。尺寸宏见 `perseus_ls_defines.sv:L1040-L1104`。
 **RTL:** `perseus_ls_pf.sv` 及其 15 个子模块
-**Pilot status:** deferred
+**Pilot 状态:** deferred
 
 ### ls_prq — 预取请求队列
 8 项 (`PERSEUS_LS_PRQ_SIZE=8`，`perseus_ls_defines.sv:L1104`) 缓冲 PF 产生的待发请求；`ls_prq_entry` 为 L3 单项。
 **RTL:** `perseus_ls_prq.sv`, `perseus_ls_prq_entry.sv`（顶层实例 `perseus_loadstore.sv:L18790`）
-**Pilot status:** deferred
+**Pilot 状态:** deferred
 
 ### ls_spe — Statistical Profiling Extension
 采样 load/store 延迟、PA、属性并通过 `spe_*` 端口外送。
 **RTL:** `perseus_ls_spe.sv`（顶层实例 `perseus_loadstore.sv:L18881`）
-**Pilot status:** deferred
+**Pilot 状态:** deferred
 
 ### ls_va_region_table / ls_va_region_entry — VA Region 表
 记录活跃 VA region，用于 watchpoint 与 MTE 标签检查加速。
 **RTL:** `perseus_ls_va_region_table.sv`, `perseus_ls_va_region_entry.sv`（顶层实例 `perseus_loadstore.sv:L16534`）
-**Pilot status:** deferred
+**Pilot 状态:** deferred
 
 ### ls_mpmm_ctl — MPMM 节流控制
 根据 `dt_ls_mpmm_gear` / `dt_ls_mpmm_g*_athr/tp` 与活动度产生 `ls_am_max_pwr_throttle_active[2:0]`，同时受 `is_ls_max_pwr` 影响。
 **RTL:** `perseus_ls_mpmm_ctl.sv`（顶层实例 `perseus_loadstore.sv:L19128`）
-**Pilot status:** deferred
+**Pilot 状态:** deferred
 
 ### ls_mbist — 存储器内建自测
 对 tag/data RAM 执行 MBIST；字段由 `PERSEUS_LS_MBIST_*` 宏定义 (`perseus_ls_defines.sv:L1235-L1243`)。
 **RTL:** `perseus_ls_mbist.sv`（顶层实例 `perseus_loadstore.sv:L13171`）
-**Pilot status:** deferred
+**Pilot 状态:** deferred
 
 ### ls_rst — 复位同步
 综合 `reset_i` + `poreset` 生成 LSU 内部复位树；前置于所有实例。
 **RTL:** `perseus_ls_rst.sv`（顶层实例 `perseus_loadstore.sv:L9512`）
-**Pilot status:** deferred
+**Pilot 状态:** deferred
 
 ### ls_stid_add / ls_stid_inc / ls_uid_minus1 / ls_sb_read_pair / ls_multi_hit_detect / ls_sec_chance — 小型算子
 一组窄宽度组合/时序算子：`stid_add/inc` 做 wrap-around 加；`uid_minus1` 做 UID 回滚；`sb_read_pair` 支持 store-buffer 双端口读；`multi_hit_detect` 在 tag 比对阶段检测多 way 同时命中；`sec_chance` 协同 PLRU 给 victim 一次存活机会。
 **RTL:** `perseus_ls_stid_add.sv`, `perseus_ls_stid_inc.sv`, `perseus_ls_uid_minus1.sv`, `perseus_ls_sb_read_pair.sv`, `perseus_ls_multi_hit_detect.sv`, `perseus_ls_sec_chance.sv`
-**Pilot status:** deferred
+**Pilot 状态:** deferred
 
 > 以上共覆盖 `ls` 目录 `perseus_ls_*.sv` 全量 77 个文件（包括 defines/params 头文件不作为模块）。其中 `perseus_ls_defines.sv` / `perseus_ls_params.sv` 为宏/参数头，不是模块实例。
 
@@ -400,7 +400,7 @@ Pilot 只深入 `ls_age_matrix`（三个 L3 pilot 模块中的共享基座）；
 | `ras_*` / `ls_ras_*` | RAS | 0 | 4 | 错误中断/事件通道。 |
 | `misc_*` / `cb_*` / `am_*` / `rn_*` / `bx_*` / `pmu_*` / `axisc_*` | 杂项 | 8 | 2 | clk/reset/DFT (`cb_dftcgen`/`cb_dftramhold`)、block 控制 (`block_ls_{1,2}`、`direct_blk_en`)、功耗广播 (`ls_am_max_pwr_throttle_active`)、RN 调度反馈、BX flush、PMU 接口、AXISC 配置握手。 |
 
-> 计数基于 `awk "/^module perseus_loadstore/,/^\);/"` 在顶层端口块内用前缀自动归类；端口总数 751 (`grep -cE "^\s*input wire|^\s*output wire" = 751`)。"`ls_*`" 输出端口按第二段前缀（`ls_ct_*` → ct 分组）归入对应外部域。spe 分组输出端口全部以 `ls_spe_*` 命名，已计入 "杂项" 自动汇总但需与 §5 `u_spe` 交叉核实。
+> 计数基于 `awk "/^module perseus_loadstore/,/^\);/"` 在顶层端口块内用前缀自动归类；端口总数 751 (`grep -cE "^\s*input wire|^\s*output wire" = 751`)。“`ls_*`” 输出端口按第二段前缀（`ls_ct_*` → ct 分组）归入对应外部域。spe 分组输出端口全部以 `ls_spe_*` 命名，已计入“杂项”自动汇总但需与 §5 `u_spe` 交叉核实。
 
 ---
 
@@ -421,7 +421,7 @@ Pilot 只深入 `ls_age_matrix`（三个 L3 pilot 模块中的共享基座）；
 
 > 源：`perseus_ls_defines.sv`（共 754 个 `\`define PERSEUS_LS_` 宏，文件 2263 行）；本节摘录与 L2 结构/位宽/容量直接相关的核心参数。
 
-| Macro | 值 | 文件 | 行号 | 说明 |
+| 宏名 | 值 | 文件 | 行号 | 说明 |
 |-------|----|------|-----:|------|
 | `PERSEUS_LS_VA` | `48:0` | `perseus_ls_defines.sv` | 37 | VA 位域定义（49 位含 1 位辅助）。 |
 | `PERSEUS_LS_VA_MAX` | `48` | `perseus_ls_defines.sv` | 38 | VA MSB 索引。 |
@@ -457,7 +457,7 @@ Pilot 只深入 `ls_age_matrix`（三个 L3 pilot 模块中的共享基座）；
 
 **顶层模块参数**（`perseus_loadstore.sv:L30-L38`，非宏而是 parameter）：
 
-| Parameter | 默认值 | 说明 |
+| 参数 | 默认值 | 说明 |
 |-----------|-------:|------|
 | `CORE_CACHE_PROTECTION` | 1 | 使能 cache ECC/保护 |
 | `COHERENT_ICACHE` | 0 | 一致性 I-Cache 支持 |
